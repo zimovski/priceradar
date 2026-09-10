@@ -1,16 +1,13 @@
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timedelta
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from ..models import Product, ProductSourceLink, Retailer, Offer, PriceObservation
 from ..providers.mercadolivre import MercadoLivreProvider, MercadoLivreError
 
-
-RETAILERS = {
-    "mercadolivre": ("mercadolivre", "Mercado Livre"),
-}
+RETAILERS = {"mercadolivre": ("mercadolivre", "Mercado Livre")}
 
 
 def _retailer(db: Session, slug: str, name: str) -> Retailer:
@@ -48,13 +45,25 @@ def record_ml_detail(db: Session, product: Product, detail: dict, *, source_name
         offer.url = detail.get("url") or offer.url
         offer.active = True
 
+    now = datetime.utcnow()
+    price = float(detail["price"])
+    available = bool(detail.get("available", True))
+    last = db.scalar(
+        select(PriceObservation)
+        .where(PriceObservation.offer_id == offer.id)
+        .order_by(PriceObservation.captured_at.desc())
+        .limit(1)
+    )
+    if last and last.price == price and last.available == available and now - last.captured_at < timedelta(minutes=15):
+        return None
+
     obs = PriceObservation(
         product_id=product.id,
         offer_id=offer.id,
-        price=float(detail["price"]),
-        available=bool(detail.get("available", True)),
+        price=price,
+        available=available,
         currency=detail.get("currency") or "BRL",
-        captured_at=datetime.utcnow(),
+        captured_at=now,
         source_kind="observed",
         source_name=source_name,
     )
