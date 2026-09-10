@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+import base64
+import hashlib
 import os
 from datetime import datetime
 
+from cryptography.fernet import Fernet, InvalidToken
 from sqlalchemy import select
 
 from ..database import SessionLocal
@@ -10,15 +13,42 @@ from ..models import IntegrationCredential
 from .mercadolivre import _CredentialStore, MLCredentials
 
 _PATCHED = False
+_PREFIX = "enc:v1:"
+
+
+def _fernet() -> Fernet | None:
+    secret = os.getenv("PRICERADAR_ENCRYPTION_SECRET") or os.getenv("MERCADOLIVRE_CLIENT_SECRET")
+    if not secret:
+        return None
+    key = base64.urlsafe_b64encode(hashlib.sha256(secret.encode("utf-8")).digest())
+    return Fernet(key)
+
+
+def _encrypt(value: str | None) -> str | None:
+    if value is None:
+        return None
+    f = _fernet()
+    if not f:
+        return value
+    return _PREFIX + f.encrypt(value.encode("utf-8")).decode("ascii")
+
+
+def _decrypt(value: str | None) -> str | None:
+    if value is None:
+        return None
+    if not value.startswith(_PREFIX):
+        return value
+    f = _fernet()
+    if not f:
+        return None
+    try:
+        return f.decrypt(value[len(_PREFIX):].encode("ascii")).decode("utf-8")
+    except (InvalidToken, ValueError):
+        return None
 
 
 def enable_database_credential_store() -> None:
-    """Persiste tokens do Mercado Livre no banco do PriceRadar em servidores Linux.
-
-    No Windows mantemos o Credential Manager nativo. No Render/Linux, o banco
-    passa a ser a fonte principal; o armazenamento em arquivo da versão anterior
-    fica apenas como fallback de desenvolvimento.
-    """
+    """Persiste e cifra tokens do Mercado Livre no banco do PriceRadar."""
     global _PATCHED
     if _PATCHED or os.name == "nt":
         return
@@ -32,18 +62,17 @@ def enable_database_credential_store() -> None:
         try:
             db = SessionLocal()
             try:
-                row = db.scalar(
-                    select(IntegrationCredential).where(
-                        IntegrationCredential.provider_slug == "mercadolivre"
-                    )
-                )
+                row = db.scalar(select(IntegrationCredential).where(IntegrationCredential.provider_slug == "mercadolivre"))
                 if row:
-                    return MLCredentials(
-                        access_token=row.access_token,
-                        refresh_token=row.refresh_token,
-                        app_id=os.getenv("MERCADOLIVRE_APP_ID"),
-                        client_secret=os.getenv("MERCADOLIVRE_CLIENT_SECRET"),
-                    )
+                    access = _decrypt(row.access_token)
+                    refresh = _decrypt(row.refresh_token)
+                    if access:
+                        return MLCredentials(
+                            access_token=access,
+                            refresh_token=refresh,
+                            app_id=os.getenv("MERCADOLIVRE_APP_ID"),
+                            client_secret=os.getenv("MERCADOLIVRE_CLIENT_SECRET"),
+                        )
             finally:
                 db.close()
         except Exception:
@@ -54,21 +83,19 @@ def enable_database_credential_store() -> None:
         try:
             db = SessionLocal()
             try:
-                row = db.scalar(
-                    select(IntegrationCredential).where(
-                        IntegrationCredential.provider_slug == "mercadolivre"
-                    )
-                )
+                row = db.scalar(select(IntegrationCredential).where(IntegrationCredential.provider_slug == "mercadolivre"))
+                encrypted_access = _encrypt(cred.access_token) or cred.access_token
+                encrypted_refresh = _encrypt(cred.refresh_token)
                 if not row:
                     row = IntegrationCredential(
                         provider_slug="mercadolivre",
-                        access_token=cred.access_token,
-                        refresh_token=cred.refresh_token,
+                        access_token=encrypted_access,
+                        refresh_token=encrypted_refresh,
                     )
                     db.add(row)
                 else:
-                    row.access_token = cred.access_token
-                    row.refresh_token = cred.refresh_token
+                    row.access_token = encrypted_access
+                    row.refresh_token = encrypted_refresh
                     row.updated_at = datetime.utcnow()
                 db.commit()
                 return
@@ -84,11 +111,7 @@ def enable_database_credential_store() -> None:
         try:
             db = SessionLocal()
             try:
-                row = db.scalar(
-                    select(IntegrationCredential).where(
-                        IntegrationCredential.provider_slug == "mercadolivre"
-                    )
-                )
+                row = db.scalar(select(IntegrationCredential).where(IntegrationCredential.provider_slug == "mercadolivre"))
                 if row:
                     db.delete(row)
                     db.commit()
