@@ -1,0 +1,144 @@
+from __future__ import annotations
+
+import base64
+import hashlib
+import os
+import secrets
+import time
+from urllib.parse import urlencode
+
+from fastapi import Request
+from fastapi.responses import HTMLResponse, RedirectResponse
+
+from .main import app
+from .providers.mercadolivre import MercadoLivreProvider, MercadoLivreError
+
+# V2.2 OAuth layer. Keeping it isolated avoids disturbing the price/history API
+# while we validate Mercado Livre authentication in production.
+
+AUTH_URL = "https://auth.mercadolivre.com.br/authorization"
+OAUTH_STATES: dict[str, tuple[float, str | None]] = {}
+STATE_TTL_SECONDS = 600
+
+
+def _pkce_enabled() -> bool:
+    return os.getenv("MERCADOLIVRE_PKCE", "1").lower() not in {"0", "false", "no"}
+
+
+def _cleanup_states() -> None:
+    now = time.time()
+    expired = [key for key, (created, _) in OAUTH_STATES.items() if now - created > STATE_TTL_SECONDS]
+    for key in expired:
+        OAUTH_STATES.pop(key, None)
+
+
+def _redirect_uri(request: Request) -> str:
+    explicit = os.getenv("MERCADOLIVRE_REDIRECT_URI")
+    if explicit:
+        return explicit.strip()
+    return str(request.url_for("mercadolivre_oauth_callback"))
+
+
+@app.get("/mercadolivre/connect", include_in_schema=False)
+def mercadolivre_connect(request: Request):
+    ml = MercadoLivreProvider()
+    app_id = ml.app_id()
+    if not app_id or not ml.client_secret():
+        return HTMLResponse(
+            "<h2>PriceRadar</h2><p>Configure MERCADOLIVRE_APP_ID e MERCADOLIVRE_CLIENT_SECRET no Render primeiro.</p>",
+            status_code=500,
+        )
+
+    _cleanup_states()
+    state = secrets.token_urlsafe(32)
+    verifier: str | None = None
+    params = {
+        "response_type": "code",
+        "client_id": app_id,
+        "redirect_uri": _redirect_uri(request),
+        "state": state,
+    }
+
+    if _pkce_enabled():
+        verifier = secrets.token_urlsafe(64)
+        digest = hashlib.sha256(verifier.encode("ascii")).digest()
+        challenge = base64.urlsafe_b64encode(digest).rstrip(b"=").decode("ascii")
+        params["code_challenge"] = challenge
+        params["code_challenge_method"] = "S256"
+
+    OAUTH_STATES[state] = (time.time(), verifier)
+    return RedirectResponse(f"{AUTH_URL}?{urlencode(params)}", status_code=302)
+
+
+@app.get("/mercadolivre/oauth/callback", response_class=HTMLResponse, include_in_schema=False, name="mercadolivre_oauth_callback")
+def mercadolivre_oauth_callback(
+    request: Request,
+    code: str | None = None,
+    error: str | None = None,
+    error_description: str | None = None,
+    state: str | None = None,
+):
+    if error:
+        detail = error_description or error
+        return HTMLResponse(
+            f"<h1>PriceRadar</h1><h2>Autorização não concluída</h2><p>{detail}</p>",
+            status_code=400,
+        )
+    if not code or not state:
+        return HTMLResponse(
+            "<h1>PriceRadar</h1><h2>Retorno OAuth inválido</h2><p>Faltou o código ou o state.</p>",
+            status_code=400,
+        )
+
+    _cleanup_states()
+    pending = OAUTH_STATES.pop(state, None)
+    if not pending:
+        return HTMLResponse(
+            "<h1>PriceRadar</h1><h2>Sessão expirada</h2><p>Inicie novamente a conexão com o Mercado Livre.</p>",
+            status_code=400,
+        )
+
+    _, verifier = pending
+    ml = MercadoLivreProvider()
+    try:
+        ml.exchange_authorization_code(
+            code=code,
+            redirect_uri=_redirect_uri(request),
+            code_verifier=verifier,
+        )
+        account = ml.test_connection()
+    except MercadoLivreError as exc:
+        return HTMLResponse(
+            f"<h1>PriceRadar</h1><h2>Não foi possível concluir a conexão</h2><p>{str(exc)}</p>",
+            status_code=400,
+        )
+
+    nickname = account.get("nickname") or "conta autorizada"
+    return HTMLResponse(
+        f"""
+        <!doctype html>
+        <html lang="pt-br"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+        <title>PriceRadar • Mercado Livre conectado</title></head>
+        <body style="font-family:system-ui;background:#f4f7fb;color:#152033;margin:0">
+          <main style="max-width:680px;margin:70px auto;background:white;padding:32px;border-radius:18px;border:1px solid #e3e8ef">
+            <h1>PriceRadar</h1>
+            <h2 style="color:#17703b">Mercado Livre conectado ✓</h2>
+            <p>A conta <strong>{nickname}</strong> foi autorizada com sucesso.</p>
+            <p>O PriceRadar já pode usar a API do Mercado Livre para testar buscas e registrar preços.</p>
+            <p><a href="/" style="font-weight:700">Voltar ao PriceRadar</a></p>
+          </main>
+        </body></html>
+        """
+    )
+
+
+@app.get("/api/integrations/mercadolivre/oauth-status")
+def mercadolivre_oauth_status():
+    ml = MercadoLivreProvider()
+    if not ml.configured():
+        return {"configured": False, "oauth_ready": ml.oauth_ready()}
+    try:
+        account = ml.test_connection()
+        return {"configured": True, "oauth_ready": ml.oauth_ready(), "account": account}
+    except MercadoLivreError as exc:
+        return {"configured": True, "oauth_ready": ml.oauth_ready(), "ok": False, "message": str(exc)}
