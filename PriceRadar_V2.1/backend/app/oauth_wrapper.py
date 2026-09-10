@@ -12,11 +12,12 @@ from fastapi.responses import HTMLResponse, RedirectResponse
 
 from .main import app
 from .providers.mercadolivre import MercadoLivreProvider, MercadoLivreError
+from .providers.mercadolivre_db_store import enable_database_credential_store
 from .providers.mercadolivre_price_enrichment import enable_price_enrichment
 
-# V2.2 OAuth layer. Keeping it isolated avoids disturbing the price/history API
-# while we validate Mercado Livre authentication in production.
-# Price enrichment is enabled here because Render starts this module.
+# V2.3: Render inicia este módulo. Depois que main cria as tabelas, ativamos
+# persistência dos tokens no banco e enriquecimento de preços do Mercado Livre.
+enable_database_credential_store()
 enable_price_enrichment()
 
 AUTH_URL = "https://auth.mercadolivre.com.br/authorization"
@@ -127,7 +128,7 @@ def mercadolivre_oauth_callback(
             <h1>PriceRadar</h1>
             <h2 style="color:#17703b">Mercado Livre conectado ✓</h2>
             <p>A conta <strong>{nickname}</strong> foi autorizada com sucesso.</p>
-            <p>O PriceRadar já pode usar a API do Mercado Livre para testar buscas e registrar preços.</p>
+            <p>Os tokens foram armazenados no banco do PriceRadar e poderão sobreviver aos próximos deploys quando o PostgreSQL estiver conectado.</p>
             <p><a href="/" style="font-weight:700">Voltar ao PriceRadar</a></p>
           </main>
         </body></html>
