@@ -12,9 +12,12 @@ from fastapi.responses import HTMLResponse, RedirectResponse
 
 from .main import app
 from .providers.mercadolivre import MercadoLivreProvider, MercadoLivreError
+from .providers.mercadolivre_price_enrichment import enable_price_enrichment
 
 # V2.2 OAuth layer. Keeping it isolated avoids disturbing the price/history API
 # while we validate Mercado Livre authentication in production.
+# Price enrichment is enabled here because Render starts this module.
+enable_price_enrichment()
 
 AUTH_URL = "https://auth.mercadolivre.com.br/authorization"
 OAUTH_STATES: dict[str, tuple[float, str | None]] = {}
