@@ -1,0 +1,22 @@
+services:
+  - type: web
+    name: priceradar
+    runtime: python
+    plan: free
+    rootDir: PriceRadar_V2.1/backend
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn app.oauth_wrapper:app --host 0.0.0.0 --port $PORT
+    healthCheckPath: /health
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.13.7
+      - key: AUTO_COLLECTION
+        value: "0"
+      - key: DATABASE_URL
+        sync: false
+      - key: MERCADOLIVRE_APP_ID
+        sync: false
+      - key: MERCADOLIVRE_CLIENT_SECRET
+        sync: false
+      - key: COLLECTOR_SECRET
+        sync: false
