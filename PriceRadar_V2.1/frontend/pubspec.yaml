@@ -1,0 +1,22 @@
+name: preco_certo
+publish_to: 'none'
+description: Comparador e histórico de preços
+version: 0.2.0+2
+
+environment:
+  sdk: '>=3.5.0 <4.0.0'
+
+dependencies:
+  flutter:
+    sdk: flutter
+  http: any
+  intl: any
+  fl_chart: any
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  flutter_lints: any
+
+flutter:
+  uses-material-design: true

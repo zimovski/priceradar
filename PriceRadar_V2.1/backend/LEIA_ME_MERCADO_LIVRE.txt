@@ -1,0 +1,14 @@
+PREÇOCERTO V2 - MERCADO LIVRE
+
+1) A V2 não usa preços fictícios.
+2) Para resultados reais do Mercado Livre, é necessário um Access Token da API oficial.
+3) Abra o PriceRadar e clique em "Configurar Mercado Livre".
+4) Cole o Access Token e clique em "Salvar e testar conexão".
+5) Para coleta contínua, também preencha Refresh Token, APP ID e Secret Key.
+
+As credenciais são guardadas no Gerenciador de Credenciais do Windows.
+Não envie suas credenciais para outras pessoas.
+
+Documentação oficial:
+https://developers.mercadolivre.com.br/pt_br/crie-uma-aplicacao-no-mercado-livre
+https://developers.mercadolivre.com.br/pt_br/autenticacao-e-autorizacao
