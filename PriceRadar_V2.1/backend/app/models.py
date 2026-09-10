@@ -88,3 +88,18 @@ class WatchlistItem(Base):
     product_id: Mapped[int] = mapped_column(ForeignKey("products.id"), index=True)
     target_price: Mapped[float | None] = mapped_column(Float, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+
+class IntegrationCredential(Base):
+    """Tokens de integrações externas.
+
+    Nesta fase do protótipo os tokens ficam no banco privado do backend. Antes
+    de produção multiusuário, adicionaremos criptografia em repouso e vínculo
+    por usuário/conta.
+    """
+    __tablename__ = "integration_credentials"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    provider_slug: Mapped[str] = mapped_column(String(60), unique=True, index=True)
+    access_token: Mapped[str] = mapped_column(String(4000))
+    refresh_token: Mapped[str | None] = mapped_column(String(4000), nullable=True)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
