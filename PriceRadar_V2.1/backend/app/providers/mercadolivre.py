@@ -5,6 +5,7 @@ import json
 import os
 from ctypes import wintypes
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 import httpx
@@ -26,10 +27,12 @@ class MLCredentials:
 
 
 class _CredentialStore:
-    """Guarda as credenciais fora do navegador.
+    """Armazena credenciais fora do navegador.
 
-    No Windows usa o Credential Manager nativo. Em outros sistemas a V2 aceita
-    apenas variáveis de ambiente; isso mantém o protótipo sem dependências extras.
+    No Windows usamos o Credential Manager. Em Linux/Render a V2.2 usa um
+    arquivo privado local apenas para o protótipo. Esse arquivo é efêmero no
+    plano gratuito do Render; migraremos os tokens para PostgreSQL antes de
+    considerar a aplicação pronta para uso contínuo/multiusuário.
     """
 
     @staticmethod
@@ -45,12 +48,37 @@ class _CredentialStore:
         )
 
     @staticmethod
+    def _file_path() -> Path:
+        return Path(os.getenv("PRICERADAR_ML_CREDENTIAL_FILE", ".priceradar_ml_credentials.json"))
+
+    @staticmethod
+    def _read_file() -> MLCredentials | None:
+        path = _CredentialStore._file_path()
+        if not path.exists():
+            return None
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+            return MLCredentials(**data)
+        except Exception:
+            return None
+
+    @staticmethod
+    def _write_file(cred: MLCredentials) -> None:
+        path = _CredentialStore._file_path()
+        path.write_text(json.dumps(cred.__dict__, separators=(",", ":")), encoding="utf-8")
+        try:
+            path.chmod(0o600)
+        except Exception:
+            pass
+
+    @staticmethod
     def read() -> MLCredentials | None:
         env = _CredentialStore._from_env()
         if env:
             return env
+
         if os.name != "nt":
-            return None
+            return _CredentialStore._read_file()
 
         CRED_TYPE_GENERIC = 1
 
@@ -95,10 +123,8 @@ class _CredentialStore:
     @staticmethod
     def write(cred: MLCredentials) -> None:
         if os.name != "nt":
-            raise MercadoLivreError(
-                "Nesta versão, salvar credenciais pela interface está disponível no Windows. "
-                "Em outros sistemas, use MERCADOLIVRE_ACCESS_TOKEN nas variáveis de ambiente."
-            )
+            _CredentialStore._write_file(cred)
+            return
 
         CRED_TYPE_GENERIC = 1
         CRED_PERSIST_LOCAL_MACHINE = 2
@@ -146,6 +172,11 @@ class _CredentialStore:
     @staticmethod
     def delete() -> None:
         if os.name != "nt":
+            path = _CredentialStore._file_path()
+            try:
+                path.unlink(missing_ok=True)
+            except Exception:
+                pass
             return
         advapi32 = ctypes.WinDLL("Advapi32.dll")
         advapi32.CredDeleteW.argtypes = [wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD]
@@ -160,6 +191,17 @@ class MercadoLivreProvider:
     def __init__(self):
         self.timeout = 18.0
 
+    @staticmethod
+    def app_id() -> str | None:
+        return os.getenv("MERCADOLIVRE_APP_ID")
+
+    @staticmethod
+    def client_secret() -> str | None:
+        return os.getenv("MERCADOLIVRE_CLIENT_SECRET")
+
+    def oauth_ready(self) -> bool:
+        return bool(self.app_id() and self.client_secret())
+
     def _load_credentials(self) -> MLCredentials | None:
         return _CredentialStore.read()
 
@@ -168,8 +210,8 @@ class MercadoLivreProvider:
         _CredentialStore.write(MLCredentials(
             access_token=access_token.strip(),
             refresh_token=(refresh_token or "").strip() or None,
-            app_id=(app_id or "").strip() or None,
-            client_secret=(client_secret or "").strip() or None,
+            app_id=(app_id or self.app_id() or "").strip() or None,
+            client_secret=(client_secret or self.client_secret() or "").strip() or None,
         ))
 
     def clear_credentials(self):
@@ -178,26 +220,71 @@ class MercadoLivreProvider:
     def configured(self) -> bool:
         return self._load_credentials() is not None
 
+    def exchange_authorization_code(self, code: str, redirect_uri: str, code_verifier: str | None = None) -> MLCredentials:
+        app_id = self.app_id()
+        secret = self.client_secret()
+        if not app_id or not secret:
+            raise MercadoLivreError("APP ID ou Client Secret não configurados no Render.")
+        data = {
+            "grant_type": "authorization_code",
+            "client_id": app_id,
+            "client_secret": secret,
+            "code": code,
+            "redirect_uri": redirect_uri,
+        }
+        if code_verifier:
+            data["code_verifier"] = code_verifier
+        try:
+            with httpx.Client(timeout=self.timeout) as client:
+                r = client.post(
+                    f"{API}/oauth/token",
+                    data=data,
+                    headers={"accept": "application/json", "content-type": "application/x-www-form-urlencoded"},
+                )
+        except httpx.RequestError as exc:
+            raise MercadoLivreError("Não consegui conectar ao OAuth do Mercado Livre.") from exc
+        if r.status_code >= 400:
+            try:
+                body = r.json()
+                detail = body.get("message") or body.get("error_description") or body.get("error") or str(body)
+            except Exception:
+                detail = r.text[:240]
+            raise MercadoLivreError(f"Falha ao gerar token ({r.status_code}): {detail}")
+        body = r.json()
+        cred = MLCredentials(
+            access_token=body["access_token"],
+            refresh_token=body.get("refresh_token"),
+            app_id=app_id,
+            client_secret=secret,
+        )
+        _CredentialStore.write(cred)
+        return cred
+
     def _refresh(self, cred: MLCredentials) -> MLCredentials:
-        if not (cred.refresh_token and cred.app_id and cred.client_secret):
-            raise MercadoLivreError(
-                "O Access Token expirou. Configure também Refresh Token, APP ID e Secret Key para renovação automática."
-            )
+        app_id = cred.app_id or self.app_id()
+        secret = cred.client_secret or self.client_secret()
+        if not (cred.refresh_token and app_id and secret):
+            raise MercadoLivreError("O Access Token expirou e não há dados suficientes para renová-lo automaticamente.")
         with httpx.Client(timeout=self.timeout) as client:
             r = client.post(f"{API}/oauth/token", data={
                 "grant_type": "refresh_token",
-                "client_id": cred.app_id,
-                "client_secret": cred.client_secret,
+                "client_id": app_id,
+                "client_secret": secret,
                 "refresh_token": cred.refresh_token,
             }, headers={"accept": "application/json", "content-type": "application/x-www-form-urlencoded"})
         if r.status_code >= 400:
-            raise MercadoLivreError(f"Falha ao renovar token do Mercado Livre ({r.status_code}).")
+            try:
+                body = r.json()
+                detail = body.get("message") or body.get("error_description") or body.get("error") or ""
+            except Exception:
+                detail = r.text[:200]
+            raise MercadoLivreError(f"Falha ao renovar token do Mercado Livre ({r.status_code}): {detail}".strip())
         data = r.json()
         new = MLCredentials(
             access_token=data["access_token"],
             refresh_token=data.get("refresh_token") or cred.refresh_token,
-            app_id=cred.app_id,
-            client_secret=cred.client_secret,
+            app_id=app_id,
+            client_secret=secret,
         )
         _CredentialStore.write(new)
         return new
@@ -205,7 +292,7 @@ class MercadoLivreProvider:
     def _request(self, method: str, path: str, *, params: dict[str, Any] | None = None) -> Any:
         cred = self._load_credentials()
         if not cred:
-            raise MercadoLivreError("Mercado Livre ainda não está configurado.")
+            raise MercadoLivreError("Mercado Livre ainda não está conectado.")
         headers = {"Authorization": f"Bearer {cred.access_token}", "Accept": "application/json"}
         with httpx.Client(timeout=self.timeout, follow_redirects=True) as client:
             try:
