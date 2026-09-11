@@ -15,7 +15,7 @@ from .database import get_db
 from .main import app
 from .models import Offer, PriceObservation, Product, Retailer
 
-VERSION = "0.2.4"
+VERSION = "0.2.7"
 app.version = VERSION
 _RATE_BUCKETS: dict[str, deque[float]] = defaultdict(deque)
 
