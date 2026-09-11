@@ -1,9 +1,10 @@
 from __future__ import annotations
 
+from pathlib import Path
 from urllib.parse import urlparse
 
 from fastapi import Depends, HTTPException
-from fastapi.responses import RedirectResponse
+from fastapi.responses import FileResponse, RedirectResponse
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
@@ -11,6 +12,13 @@ from .database import get_db
 from .main import app
 from .models import Offer, PriceObservation, Product, ProductSourceLink, Retailer
 from .services.collector import refresh_product
+
+STATIC_DIR = Path(__file__).parent / "static"
+
+
+@app.get("/static/logo.svg", include_in_schema=False)
+def priceradar_logo():
+    return FileResponse(STATIC_DIR / "logo.svg", media_type="image/svg+xml")
 
 
 def _safe_store_url(url: str | None) -> str | None:
@@ -79,8 +87,6 @@ def v28_best_offer(product_id: int, db: Session = Depends(get_db)):
 
     best = _best_offer(db, product_id)
     if not best or not _safe_store_url(best[1].url):
-        # Old tracked products may have been saved before the direct permalink
-        # was persisted. Refreshing once repairs the Offer URL in PostgreSQL.
         _refresh_without_breaking(db, product_id)
         best = _best_offer(db, product_id)
 
@@ -101,18 +107,11 @@ def v28_best_offer(product_id: int, db: Session = Depends(get_db)):
 
 @app.get("/go/product/{product_id}", include_in_schema=False)
 def go_to_best_offer(product_id: int, db: Session = Depends(get_db)):
-    """Resolve the current listing server-side and redirect to the store.
-
-    This route intentionally does not redirect back to PriceRadar when the URL
-    is missing: a failure is shown as an error instead of creating a confusing
-    loop to the top of the same page.
-    """
+    """Refresh the listing and redirect directly to its Mercado Livre page."""
     product = db.get(Product, product_id)
     if not product:
         raise HTTPException(404, "Produto não encontrado")
 
-    # Always refresh before purchase so the user receives a current listing and
-    # old products get their Mercado Livre permalink repaired automatically.
     _refresh_without_breaking(db, product_id)
 
     for _obs, offer, _retailer in _latest_offer_candidates(db, product_id):
@@ -120,8 +119,6 @@ def go_to_best_offer(product_id: int, db: Session = Depends(get_db)):
         if direct:
             return RedirectResponse(direct, status_code=302)
 
-    # Last-resort fallback: an older ProductSourceLink can already contain a
-    # valid product/listing URL even if the Offer row predates URL persistence.
     links = db.scalars(
         select(ProductSourceLink).where(ProductSourceLink.product_id == product_id)
     ).all()
@@ -132,5 +129,5 @@ def go_to_best_offer(product_id: int, db: Session = Depends(get_db)):
 
     raise HTTPException(
         404,
-        "O Mercado Livre retornou o preço, mas ainda não forneceu um link de compra válido para esta oferta. Atualize o produto e tente novamente.",
+        "O Mercado Livre retornou o preço, mas ainda não forneceu um link de compra válido para esta oferta.",
     )
