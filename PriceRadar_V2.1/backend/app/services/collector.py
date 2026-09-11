@@ -79,14 +79,25 @@ def refresh_product(db: Session, product_id: int) -> dict:
     links = db.scalars(select(ProductSourceLink).where(ProductSourceLink.product_id == product_id)).all()
     observations = 0
     errors = []
+    links_updated = 0
     for link in links:
         if link.provider_slug == "mercadolivre":
             try:
                 provider = MercadoLivreProvider()
                 detail = provider.product_detail(link.external_product_id)
+                direct_url = detail.get("url")
+                if direct_url and link.source_url != direct_url:
+                    link.source_url = direct_url
+                    links_updated += 1
                 if record_ml_detail(db, product, detail):
                     observations += 1
             except MercadoLivreError as exc:
                 errors.append(str(exc))
     db.commit()
-    return {"product_id": product_id, "ok": not errors, "message": "; ".join(errors) or None, "observations": observations}
+    return {
+        "product_id": product_id,
+        "ok": not errors,
+        "message": "; ".join(errors) or None,
+        "observations": observations,
+        "links_updated": links_updated,
+    }
