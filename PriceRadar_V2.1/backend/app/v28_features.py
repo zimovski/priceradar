@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -11,6 +12,7 @@ from sqlalchemy.orm import Session
 from .database import get_db
 from .main import app
 from .models import Offer, PriceObservation, Product, ProductSourceLink, Retailer
+from .providers.mercadolivre import MercadoLivreProvider, MercadoLivreError
 from .services.collector import refresh_product
 
 STATIC_DIR = Path(__file__).parent / "static"
@@ -40,6 +42,13 @@ def _safe_store_url(url: str | None) -> str | None:
             return url.strip()
     except Exception:
         pass
+    return None
+
+
+def _catalog_url(external_product_id: str | None) -> str | None:
+    compact = re.sub(r"[^A-Za-z0-9]", "", str(external_product_id or "")).upper()
+    if re.fullmatch(r"MLB\d+", compact):
+        return f"https://www.mercadolivre.com.br/p/{compact}"
     return None
 
 
@@ -79,6 +88,53 @@ def _best_offer(db: Session, product_id: int):
     return candidates[0] if candidates else None
 
 
+def _source_links(db: Session, product_id: int) -> list[ProductSourceLink]:
+    return db.scalars(
+        select(ProductSourceLink).where(ProductSourceLink.product_id == product_id)
+    ).all()
+
+
+def _resolve_ml_url(db: Session, product_id: int) -> str | None:
+    # 1. Exact offer URL already stored in PostgreSQL.
+    for _obs, offer, _retailer in _latest_offer_candidates(db, product_id):
+        direct = _safe_store_url(offer.url)
+        if direct:
+            return direct
+
+    links = _source_links(db, product_id)
+
+    # 2. Product/source URL already stored from a prior collection.
+    for link in links:
+        direct = _safe_store_url(link.source_url)
+        if direct:
+            return direct
+
+    # 3. Ask the provider again. The price enrichment layer now retries the
+    # public /items endpoint and builds an item VIP URL when permalink is absent.
+    provider = MercadoLivreProvider()
+    for link in links:
+        if link.provider_slug != "mercadolivre":
+            continue
+        try:
+            detail = provider.product_detail(link.external_product_id)
+            direct = _safe_store_url(detail.get("url"))
+            if direct:
+                link.source_url = direct
+                db.commit()
+                return direct
+        except MercadoLivreError:
+            db.rollback()
+
+    # 4. Guaranteed Mercado Livre purchase path for a tracked catalog product.
+    # This goes to the Mercado Livre PDP, where the active sellers are offered.
+    for link in links:
+        if link.provider_slug == "mercadolivre":
+            fallback = _catalog_url(link.external_product_id)
+            if fallback:
+                return fallback
+    return None
+
+
 @app.get("/api/v28/products/{product_id}/best-offer")
 def v28_best_offer(product_id: int, db: Session = Depends(get_db)):
     product = db.get(Product, product_id)
@@ -86,9 +142,11 @@ def v28_best_offer(product_id: int, db: Session = Depends(get_db)):
         raise HTTPException(404, "Produto não encontrado")
 
     best = _best_offer(db, product_id)
-    if not best or not _safe_store_url(best[1].url):
+    direct_url = _safe_store_url(best[1].url) if best else None
+    if not direct_url:
         _refresh_without_breaking(db, product_id)
         best = _best_offer(db, product_id)
+        direct_url = _resolve_ml_url(db, product_id)
 
     if not best:
         return None
@@ -100,34 +158,24 @@ def v28_best_offer(product_id: int, db: Session = Depends(get_db)):
         "price": obs.pix_price or obs.price,
         "regular_price": obs.price,
         "seller_name": offer.seller_name,
-        "url": _safe_store_url(offer.url),
+        "url": direct_url,
         "captured_at": obs.captured_at,
     }
 
 
 @app.get("/go/product/{product_id}", include_in_schema=False)
 def go_to_best_offer(product_id: int, db: Session = Depends(get_db)):
-    """Refresh the listing and redirect directly to its Mercado Livre page."""
+    """Refresh, resolve and redirect to a real Mercado Livre purchase path."""
     product = db.get(Product, product_id)
     if not product:
         raise HTTPException(404, "Produto não encontrado")
 
     _refresh_without_breaking(db, product_id)
-
-    for _obs, offer, _retailer in _latest_offer_candidates(db, product_id):
-        direct = _safe_store_url(offer.url)
-        if direct:
-            return RedirectResponse(direct, status_code=302)
-
-    links = db.scalars(
-        select(ProductSourceLink).where(ProductSourceLink.product_id == product_id)
-    ).all()
-    for link in links:
-        direct = _safe_store_url(link.source_url)
-        if direct:
-            return RedirectResponse(direct, status_code=302)
+    direct = _resolve_ml_url(db, product_id)
+    if direct:
+        return RedirectResponse(direct, status_code=302)
 
     raise HTTPException(
         404,
-        "O Mercado Livre retornou o preço, mas ainda não forneceu um link de compra válido para esta oferta.",
+        "Não foi possível obter uma rota de compra do Mercado Livre para este produto agora.",
     )
