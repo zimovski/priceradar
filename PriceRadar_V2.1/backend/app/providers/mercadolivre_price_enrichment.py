@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-import re
-import unicodedata
 from typing import Any
 
 import httpx
@@ -21,37 +19,8 @@ def _number(value: Any) -> float | None:
         return None
 
 
-def _slug(text: str | None) -> str:
-    raw = unicodedata.normalize("NFKD", text or "produto")
-    ascii_text = "".join(ch for ch in raw if not unicodedata.combining(ch))
-    ascii_text = ascii_text.lower()
-    ascii_text = re.sub(r"[^a-z0-9]+", "-", ascii_text).strip("-")
-    return ascii_text[:140] or "produto"
-
-
-def _constructed_item_url(item_id: str | None, title: str | None) -> str | None:
-    """Build a Mercado Livre VIP URL from a public item id.
-
-    Mercado Livre VIP permalinks are keyed by the item id. The title portion is
-    human-readable and this fallback is only used when the API omits permalink.
-    """
-    compact = re.sub(r"[^A-Za-z0-9]", "", str(item_id or "")).upper()
-    match = re.fullmatch(r"([A-Z]{3})(\d+)", compact)
-    if not match:
-        return None
-    site, number = match.groups()
-    return f"https://produto.mercadolivre.com.br/{site}-{number}-{_slug(title)}-_JM"
-
-
-def _catalog_url(product_id: str | None) -> str | None:
-    compact = re.sub(r"[^A-Za-z0-9]", "", str(product_id or "")).upper()
-    if not re.fullmatch(r"MLB\d+", compact):
-        return None
-    return f"https://www.mercadolivre.com.br/p/{compact}"
-
-
 def _public_item(self: MercadoLivreProvider, item_id: str) -> dict[str, Any]:
-    """Read the public item endpoint without OAuth as a permalink fallback."""
+    """Read a public marketplace item when the authenticated response is partial."""
     try:
         with httpx.Client(timeout=self.timeout, follow_redirects=True) as client:
             response = client.get(
@@ -68,7 +37,15 @@ def _public_item(self: MercadoLivreProvider, item_id: str) -> dict[str, Any]:
 
 
 def enable_price_enrichment() -> None:
-    """Enrich catalog products with the current marketplace offer and purchase URL."""
+    """Resolve the offer buyers actually see on the Mercado Livre product page.
+
+    IMPORTANT: older versions selected the cheapest row returned by
+    /products/{product_id}/items. That can include a competing catalog listing
+    that is not the current Buy Box winner, so the number can differ from the
+    price shown to shoppers on Mercado Livre. From V2.9 onward the canonical
+    price is tied to /products/{product_id}.buy_box_winner and then verified
+    against that exact /items/{item_id} listing.
+    """
     global _PATCHED
     if _PATCHED:
         return
@@ -77,97 +54,81 @@ def enable_price_enrichment() -> None:
     original_product_detail = MercadoLivreProvider.product_detail
 
     def product_detail_with_price(self: MercadoLivreProvider, product_id: str) -> dict[str, Any]:
+        # The base provider reads /products/{product_id} and already exposes the
+        # Buy Box winner's item_id and price. We deliberately do NOT scan all
+        # catalog competitors looking for the absolute lowest number anymore.
         detail = original_product_detail(self, product_id)
-        try:
-            data = self._request("GET", f"/products/{product_id}/items")
-        except MercadoLivreError:
-            # Even if offer discovery fails, a catalog page is a valid route to
-            # continue the purchase instead of sending the user nowhere.
-            detail["url"] = detail.get("url") or _catalog_url(product_id)
+        item_id = str(detail.get("item_id") or "").strip()
+
+        # No active Buy Box winner means there is no single verified listing we
+        # can honestly present as the current purchasable price.
+        if not item_id:
+            detail.update({
+                "price": None,
+                "original_price": None,
+                "available": False,
+                "price_source": "no_buy_box_winner",
+            })
             return detail
 
-        rows = data.get("results") or []
-        candidates: list[tuple[float, dict[str, Any]]] = []
-        for row in rows:
-            item_id = row.get("item_id")
-            price = _number(row.get("price"))
-            if not item_id or price is None or price <= 0:
-                continue
-            condition = str(row.get("condition") or "").lower()
-            if condition and condition not in {"new", "novo"}:
-                continue
-            candidates.append((price, row))
-        if not candidates:
-            detail["url"] = detail.get("url") or _catalog_url(product_id)
-            return detail
-
-        candidates.sort(key=lambda pair: pair[0])
-        listed_price, best = candidates[0]
-        item_id = str(best["item_id"])
-        current_price = listed_price
-        regular_price = None
-        currency = best.get("currency_id") or "BRL"
-
-        try:
-            sale = self._request("GET", f"/items/{item_id}/sale_price", params={"context": "channel_marketplace"})
-            sale_amount = _number(sale.get("amount"))
-            if sale_amount is not None and sale_amount > 0:
-                current_price = sale_amount
-            regular_price = _number(sale.get("regular_amount"))
-            currency = sale.get("currency_id") or currency
-        except MercadoLivreError:
-            pass
-
-        # First try the authenticated item endpoint. Some app/account
-        # permission combinations can return a partial item body, so we also
-        # retry the same public resource without OAuth when permalink is absent.
         item_detail: dict[str, Any] = {}
         try:
-            raw_item = self._request("GET", f"/items/{item_id}")
-            if isinstance(raw_item, dict):
-                item_detail = raw_item
+            raw = self._request("GET", f"/items/{item_id}")
+            if isinstance(raw, dict):
+                item_detail = raw
         except MercadoLivreError:
             pass
 
         public_detail: dict[str, Any] = {}
-        if not item_detail.get("permalink"):
+        # Some application/account combinations receive a partial /items body.
+        # Retrying the public resource is useful for permalink and visible price.
+        if not item_detail.get("permalink") or _number(item_detail.get("price")) is None:
             public_detail = _public_item(self, item_id)
 
-        seller_id = (
-            item_detail.get("seller_id")
-            or public_detail.get("seller_id")
-            or best.get("seller_id")
-        )
+        def first(*values):
+            for value in values:
+                if value not in (None, ""):
+                    return value
+            return None
+
+        # /items/{item_id}.price is the publication price documented by Mercado
+        # Livre and corresponds to the exact Buy Box item. If unavailable, use
+        # the Buy Box price returned by /products/{product_id}.
+        verified_price = _number(first(item_detail.get("price"), public_detail.get("price"), detail.get("price")))
+        original_price = _number(first(item_detail.get("original_price"), public_detail.get("original_price"), detail.get("original_price")))
+        currency = first(item_detail.get("currency_id"), public_detail.get("currency_id"), detail.get("currency")) or "BRL"
+        seller_id = first(item_detail.get("seller_id"), public_detail.get("seller_id"))
+        status = first(item_detail.get("status"), public_detail.get("status"))
+        available_qty = first(item_detail.get("available_quantity"), public_detail.get("available_quantity"))
+
         shipping = item_detail.get("shipping") if isinstance(item_detail.get("shipping"), dict) else None
         if not shipping and isinstance(public_detail.get("shipping"), dict):
             shipping = public_detail.get("shipping")
-        if not shipping:
-            shipping = best.get("shipping") if isinstance(best.get("shipping"), dict) else {}
+        shipping = shipping or {}
 
-        item_title = (
-            item_detail.get("title")
-            or public_detail.get("title")
-            or best.get("title")
-            or detail.get("name")
-        )
-        direct_url = (
-            item_detail.get("permalink")
-            or public_detail.get("permalink")
-            or _constructed_item_url(item_id, item_title)
-            or _catalog_url(product_id)
-            or detail.get("url")
-        )
+        # Prefer the exact publication permalink. The product/PDP permalink from
+        # /products is a truthful fallback and is safer than inventing a URL.
+        direct_url = first(item_detail.get("permalink"), public_detail.get("permalink"), detail.get("url"))
 
-        status = item_detail.get("status") or public_detail.get("status")
+        available = True
+        if status not in (None, "active"):
+            available = False
+        try:
+            if available_qty is not None and int(available_qty) <= 0:
+                available = False
+        except (TypeError, ValueError):
+            pass
+
         detail.update({
             "item_id": item_id,
-            "price": current_price,
-            "original_price": regular_price,
+            "price": verified_price if available else None,
+            "original_price": original_price,
             "currency": currency,
             "seller_name": f"Vendedor #{seller_id}" if seller_id else detail.get("seller_name"),
             "shipping_free": shipping.get("free_shipping") if shipping else detail.get("shipping_free"),
-            "available": status in {None, "active"},
+            "available": available and verified_price is not None,
             "url": direct_url,
+            "price_source": "buy_box_winner",
         })
         return detail
 
