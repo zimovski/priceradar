@@ -1,13 +1,15 @@
 from __future__ import annotations
 
 from datetime import datetime, timedelta
-from sqlalchemy import select
+from sqlalchemy import delete, select
 from sqlalchemy.orm import Session
 
 from ..models import Product, ProductSourceLink, Retailer, Offer, PriceObservation
 from ..providers.mercadolivre import MercadoLivreProvider, MercadoLivreError
 
 RETAILERS = {"mercadolivre": ("mercadolivre", "Mercado Livre")}
+TRUSTED_ML_SOURCE = "mercadolivre_buy_box"
+LEGACY_ML_SOURCES = {"mercadolivre_api"}
 
 
 def _retailer(db: Session, slug: str, name: str) -> Retailer:
@@ -19,9 +21,40 @@ def _retailer(db: Session, slug: str, name: str) -> Retailer:
     return row
 
 
-def record_ml_detail(db: Session, product: Product, detail: dict, *, source_name: str = "mercadolivre_api") -> int | None:
-    if not detail.get("price") or not detail.get("item_id"):
+def _remove_legacy_ml_observations_once(db: Session, product: Product) -> int:
+    """Drop prototype prices produced by the old 'cheapest catalog row' logic.
+
+    We only do this before the first trusted Buy Box observation exists for the
+    product. This prevents the experimental R$ values from contaminating the
+    historical minimum/average after V2.9 starts recording verified prices.
+    """
+    already_trusted = db.scalar(
+        select(PriceObservation.id)
+        .where(
+            PriceObservation.product_id == product.id,
+            PriceObservation.source_name == TRUSTED_ML_SOURCE,
+        )
+        .limit(1)
+    )
+    if already_trusted:
+        return 0
+
+    result = db.execute(
+        delete(PriceObservation).where(
+            PriceObservation.product_id == product.id,
+            PriceObservation.source_name.in_(LEGACY_ML_SOURCES),
+        )
+    )
+    return int(result.rowcount or 0)
+
+
+def record_ml_detail(db: Session, product: Product, detail: dict, *, source_name: str = TRUSTED_ML_SOURCE) -> int | None:
+    if not detail.get("price") or not detail.get("item_id") or not detail.get("available", True):
         return None
+
+    if detail.get("price_source") == "buy_box_winner":
+        _remove_legacy_ml_observations_once(db, product)
+
     retailer = _retailer(db, "mercadolivre", "Mercado Livre")
     offer = db.scalar(select(Offer).where(
         Offer.retailer_id == retailer.id,
@@ -54,7 +87,7 @@ def record_ml_detail(db: Session, product: Product, detail: dict, *, source_name
         .order_by(PriceObservation.captured_at.desc())
         .limit(1)
     )
-    if last and last.price == price and last.available == available and now - last.captured_at < timedelta(minutes=15):
+    if last and last.price == price and last.available == available and last.source_name == source_name and now - last.captured_at < timedelta(minutes=15):
         return None
 
     obs = PriceObservation(
