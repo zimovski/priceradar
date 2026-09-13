@@ -24,6 +24,7 @@ enable_search_enhancement()
 from . import v24_features  # noqa: E402,F401
 from . import v28_features  # noqa: E402,F401
 from . import v210_multistore  # noqa: E402,F401
+from . import v211_features  # noqa: E402,F401
 
 AUTH_URL = "https://auth.mercadolivre.com.br/authorization"
 OAUTH_STATES: dict[str, tuple[float, str | None]] = {}
@@ -92,7 +93,7 @@ def mercadolivre_oauth_callback(request: Request, code: str | None = None, error
     nickname = html.escape(account.get("nickname") or "conta autorizada")
     return HTMLResponse(f"""
     <!doctype html><html lang="pt-br"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>PriceRadar • Mercado Livre conectado</title></head>
-    <body style="font-family:system-ui;background:#f2f5f9;color:#102033;margin:0"><main style="max-width:680px;margin:70px auto;background:white;padding:32px;border-radius:20px;border:1px solid #dfe6ee;box-shadow:0 18px 45px #10203312"><div style="font-weight:900;font-size:26px">PriceRadar</div><h2 style="color:#087a55;margin-top:24px">Mercado Livre conectado ✓</h2><p>A conta <strong>{nickname}</strong> foi autorizada com sucesso.</p><p>O PriceRadar já pode pesquisar ofertas e continuar registrando o histórico no banco persistente.</p><p><a href="/" style="display:inline-block;margin-top:8px;background:#07111f;color:white;text-decoration:none;font-weight:800;padding:11px 16px;border-radius:11px">Voltar ao PriceRadar</a></p></main></body></html>
+    <body style="font-family:system-ui;background:#100f17;color:#f7f4f9;margin:0"><main style="max-width:680px;margin:70px auto;background:#1b1823;padding:32px;border-radius:20px;border:1px solid #3c3549;box-shadow:0 18px 45px #0008"><div style="font-weight:900;font-size:26px">PriceRadar</div><h2 style="color:#39e7a0;margin-top:24px">Mercado Livre conectado ✓</h2><p>A conta <strong>{nickname}</strong> foi autorizada com sucesso.</p><p>O Access Token e o Refresh Token ficam no banco persistente. Nas próximas visitas o PriceRadar renova a sessão automaticamente quando necessário.</p><p><a href="/" style="display:inline-block;margin-top:8px;background:#39e7a0;color:#07150f;text-decoration:none;font-weight:800;padding:11px 16px;border-radius:11px">Voltar ao PriceRadar</a></p></main></body></html>
     """)
 
 
@@ -103,6 +104,6 @@ def mercadolivre_oauth_status():
         return {"configured": False, "oauth_ready": ml.oauth_ready()}
     try:
         account = ml.test_connection()
-        return {"configured": True, "oauth_ready": ml.oauth_ready(), "ok": True, "account": account}
+        return {"configured": True, "oauth_ready": ml.oauth_ready(), "ok": True, "account": account, "automatic_refresh": True}
     except MercadoLivreError as exc:
-        return {"configured": True, "oauth_ready": ml.oauth_ready(), "ok": False, "message": str(exc)}
+        return {"configured": True, "oauth_ready": ml.oauth_ready(), "ok": False, "automatic_refresh": True, "message": str(exc)}
