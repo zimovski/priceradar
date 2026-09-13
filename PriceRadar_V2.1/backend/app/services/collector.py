@@ -175,6 +175,27 @@ def _variant_words(text: str | None) -> set[str]:
     return found
 
 
+def _identity_tokens(text: str | None) -> set[str]:
+    tokens = set(_tokens(text))
+    ignore = {
+        "apple", "sony", "samsung", "branco", "preto", "azul", "verde",
+        "cinza", "prata", "prateado", "dourado", "lavanda", "salvia",
+        "gb", "tb",
+    }
+    cleaned: set[str] = set()
+    for token in tokens:
+        if token in ignore:
+            continue
+        if token.isdigit() and len(token) >= 2:
+            # Capacity/generation are checked separately, so formatting such as
+            # "512 GB" versus "512GB" cannot cause a false mismatch here.
+            continue
+        if re.fullmatch(r"\d{2,4}(?:gb|tb)", token):
+            continue
+        cleaned.add(token)
+    return cleaned
+
+
 def _strong_variant_match(product: Product, candidate: dict) -> bool:
     source_name = " ".join(x for x in (product.brand, product.name, product.model) if x)
     target_name = str(candidate.get("name") or "")
@@ -198,14 +219,11 @@ def _strong_variant_match(product: Product, candidate: dict) -> bool:
     if required_variants and not required_variants.issubset(target_variants):
         return False
 
-    source_tokens = set(_tokens(source_name))
-    target_tokens = set(_tokens(target_name))
-    # Ignore cosmetic colour differences, but require enough identity overlap to
-    # avoid connecting a different generation/model merely because the brand is equal.
-    meaningful = {t for t in source_tokens if t not in {"apple", "sony", "samsung", "branco", "preto", "azul", "verde", "cinza", "prata", "prateado", "dourado"}}
+    meaningful = _identity_tokens(source_name)
+    target_tokens = _identity_tokens(target_name)
     if meaningful:
         coverage = len(meaningful & target_tokens) / len(meaningful)
-        if coverage < 0.62:
+        if coverage < 0.60:
             return False
 
     return _score(source_name, target_name) >= 18.0
@@ -253,7 +271,6 @@ def refresh_product(db: Session, product_id: int) -> dict:
     links_updated = 0
     successful_sources = 0
 
-    # Mercado Livre: persistent OAuth + automatic refresh token renewal.
     ml_links = db.scalars(select(ProductSourceLink).where(
         ProductSourceLink.product_id == product_id,
         ProductSourceLink.provider_slug == "mercadolivre",
@@ -272,8 +289,6 @@ def refresh_product(db: Session, product_id: int) -> dict:
         except MercadoLivreError as exc:
             errors.append(f"Mercado Livre: {exc}")
 
-    # Magazine Luiza: attach a public listing only when model/generation/storage
-    # match strongly enough. We prefer no Magalu price over mixing variants.
     try:
         magalu_link = _ensure_magalu_link(db, product)
         if magalu_link:
@@ -286,8 +301,6 @@ def refresh_product(db: Session, product_id: int) -> dict:
                 observations += 1
             successful_sources += 1
     except MagaluError as exc:
-        # Magalu storefront availability must never invalidate a good Mercado
-        # Livre refresh; surface the warning but keep the product usable.
         errors.append(f"Magazine Luiza: {exc}")
     except Exception:
         errors.append("Magazine Luiza: não foi possível confirmar esta variante agora.")
