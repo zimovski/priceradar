@@ -28,7 +28,7 @@ class MagaluProvider:
     slug = "magalu"
     name = "Magazine Luiza"
     base_url = "https://www.magazineluiza.com.br"
-    timeout = 20.0
+    timeout = 7.0
     cache_ttl = 300
     _cache: dict[tuple[str, int], tuple[float, list[dict[str, Any]]]] = {}
 
@@ -60,22 +60,26 @@ class MagaluProvider:
         title = re.sub(r"^(?:Patrocinado\s+)+", "", title, flags=re.I)
         title = re.sub(r"^\d+\s+mem[oó]rias?\s+", "", title, flags=re.I)
         title = re.split(r"\b(?:Preço|R\$)\b", title, maxsplit=1, flags=re.I)[0]
-        # Search cards often append rating/count before the price. Trim only a
-        # trailing rating expression, never model numbers inside the title.
         title = re.sub(r"\s+\d\.\d\s*\(\d+\)\s*$", "", title)
         return title.strip(" -|")[:500]
 
     @staticmethod
     def _request_headers() -> dict[str, str]:
+        # A browser-like request is important here: Magalu's edge sometimes
+        # delays or rejects obviously synthetic user agents even for public pages.
         return {
-            "Accept": "text/html,application/xhtml+xml",
-            "Accept-Language": "pt-BR,pt;q=0.9,en;q=0.6",
-            "User-Agent": "PriceRadar/0.2 (+price comparison prototype; public storefront read-only)",
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+            "Accept-Language": "pt-BR,pt;q=0.9,en-US;q=0.6,en;q=0.5",
+            "Cache-Control": "no-cache",
+            "Pragma": "no-cache",
+            "Upgrade-Insecure-Requests": "1",
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/152.0.0.0 Safari/537.36",
         }
 
     def _get_html(self, url: str) -> str:
         try:
-            with httpx.Client(timeout=self.timeout, follow_redirects=True, headers=self._request_headers()) as client:
+            timeout = httpx.Timeout(self.timeout, connect=min(3.5, self.timeout))
+            with httpx.Client(timeout=timeout, follow_redirects=True, headers=self._request_headers(), http2=False) as client:
                 response = client.get(url)
         except httpx.RequestError as exc:
             raise MagaluError("Não consegui consultar o Magazine Luiza agora.") from exc
@@ -83,13 +87,15 @@ class MagaluProvider:
             raise MagaluError(f"Magazine Luiza respondeu {response.status_code}.")
         return response.text
 
-    def _search_url(self, query: str) -> str:
-        # Magalu accepts '+' separated terms in /busca/. Encode the plus itself
-        # in the path so it is not accidentally treated as a literal space by
-        # intermediaries.
+    def _search_urls(self, query: str) -> list[str]:
         normalized = " ".join(query.strip().split())
-        path_term = quote(normalized.replace(" ", "+"), safe="")
-        return f"{self.base_url}/busca/{path_term}/"
+        encoded_plus = quote(normalized.replace(" ", "+"), safe="")
+        encoded_space = quote(normalized, safe="")
+        return [
+            f"{self.base_url}/busca/{encoded_plus}/",
+            f"{self.base_url}/busca/{encoded_space}/",
+            f"https://m.magazineluiza.com.br/busca/{encoded_plus}/",
+        ]
 
     def _candidate_title(self, anchor) -> str:
         img = anchor.find("img")
@@ -146,9 +152,6 @@ class MagaluProvider:
             if not values:
                 continue
 
-            # On Magalu cards the first displayed amount is normally the Pix /
-            # immediate-payment price. A later "Ou R$ ... em Nx" is the regular
-            # card price. Store both when we can identify them.
             pix_price = values[0]
             regular_match = re.search(r"\bOu\s+R\$\s*([0-9][0-9\.]*,[0-9]{2})", text, flags=re.I)
             regular_price = self._money(regular_match.group(1)) if regular_match else pix_price
@@ -196,8 +199,20 @@ class MagaluProvider:
         if cached and time.time() - cached[0] < self.cache_ttl:
             return [dict(x) for x in cached[1]]
 
-        html = self._get_html(self._search_url(query))
-        rows = self._parse_search_cards(html, query)
+        rows: list[dict[str, Any]] = []
+        last_error: Exception | None = None
+        for url in self._search_urls(query):
+            try:
+                html = self._get_html(url)
+                rows = self._parse_search_cards(html, query)
+                if rows:
+                    break
+            except MagaluError as exc:
+                last_error = exc
+                continue
+        if not rows and last_error:
+            raise MagaluError(str(last_error))
+
         fam = _family(query)
         newest = None
         if fam and _generation(query, fam) is None:
@@ -235,8 +250,6 @@ class MagaluProvider:
             title = external_product_id or "Produto Magalu"
 
         page_text = " ".join(soup.stripped_strings)
-        # Prefer the public Pix amount and keep the regular card amount
-        # separately whenever the page exposes both.
         pix_match = re.search(r"Preço\s+R\$\s*([0-9][0-9\.]*,[0-9]{2}).{0,100}?no\s+Pix", page_text, flags=re.I)
         if not pix_match:
             pix_match = re.search(r"Preço\s+R\$\s*([0-9][0-9\.]*,[0-9]{2})", page_text, flags=re.I)
