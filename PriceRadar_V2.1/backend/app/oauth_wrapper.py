@@ -39,6 +39,7 @@ from . import v210_multistore  # noqa: E402,F401
 from . import v211_features  # noqa: E402,F401
 from . import v212_resilience  # noqa: E402,F401
 from . import v215_ui  # noqa: E402,F401
+from . import v216_magalu  # noqa: E402,F401
 
 AUTH_URL = "https://auth.mercadolivre.com.br/authorization"
 OAUTH_STATES: dict[str, tuple[float, str | None]] = {}
