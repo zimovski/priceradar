@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import time
 from typing import Any, Callable
 
 from fastapi import Depends, Query
@@ -33,8 +34,9 @@ _remove_route("/api/search", "GET")
 @app.get("/", include_in_schema=False, response_class=HTMLResponse)
 def v212_web_preview():
     text = _patched_index()
-    text = text.replace("V2.11", "V2.13")
-    text = text.replace("V2.12", "V2.13")
+    text = text.replace("V2.11", "V2.14")
+    text = text.replace("V2.12", "V2.14")
+    text = text.replace("V2.13", "V2.14")
     text = text.replace("Consultando Mercado Livre...", "Consultando lojas...")
     text = text.replace("Consultando Mercado Livre e Magazine Luiza...", "Consultando lojas...")
 
@@ -89,19 +91,19 @@ async def v212_search(
         ).all()
     }
 
-    # Mercado Livre V2.13 uses /sites/MLB/search first, which already returns
-    # listing price + permalink in one request. It should therefore be much
-    # faster than the previous catalog-detail fan-out.
     ml = MercadoLivreProvider()
-    ml.timeout = min(float(getattr(ml, "timeout", 18.0)), 5.0)
+    # V2.14 uses one catalog call plus a handful of parallel product calls.
+    # A slightly larger per-call timeout is safe now because there is no large
+    # sequential fan-out anymore.
+    ml.timeout = 7.5
     magalu = MagaluProvider()
-    magalu.timeout = 7.0
+    magalu.timeout = 8.0
 
     tasks: list[tuple[str, asyncio.Task]] = []
     if ml.configured():
         tasks.append((
             "mercadolivre",
-            asyncio.create_task(_bounded(lambda: ml.search(query, limit=min(limit, 8)), 7.0)),
+            asyncio.create_task(_bounded(lambda: ml.search(query, limit=min(limit, 8)), 9.5)),
         ))
     else:
         statuses.append(ProviderStatus(
@@ -114,7 +116,7 @@ async def v212_search(
 
     tasks.append((
         "magalu",
-        asyncio.create_task(_bounded(lambda: magalu.search(query, limit=min(limit, 8)), 8.5)),
+        asyncio.create_task(_bounded(lambda: magalu.search(query, limit=min(limit, 8)), 9.5)),
     ))
 
     for slug, task in tasks:
@@ -124,15 +126,15 @@ async def v212_search(
                 _append_external(results, "mercadolivre", "Mercado Livre", rows, known_ml)
                 statuses.append(ProviderStatus(
                     slug="mercadolivre", name="Mercado Livre", configured=True, ok=True,
-                    message=f"{len(rows)} ofertas retornadas.",
+                    message=f"{len(rows)} produtos retornados.",
                 ))
             elif error == "timeout":
                 statuses.append(ProviderStatus(
                     slug="mercadolivre", name="Mercado Livre", configured=True, ok=False,
-                    message="A consulta passou de 7 segundos.",
+                    message="A API não respondeu dentro de 9 segundos.",
                 ))
             else:
-                message = str(error) if isinstance(error, MercadoLivreError) else "Mercado Livre indisponível nesta busca."
+                message = str(error) if isinstance(error, MercadoLivreError) else f"Mercado Livre indisponível: {type(error).__name__}."
                 statuses.append(ProviderStatus(
                     slug="mercadolivre", name="Mercado Livre", configured=True, ok=False, message=message
                 ))
@@ -141,15 +143,15 @@ async def v212_search(
                 _append_external(results, "magalu", "Magazine Luiza", rows, known_magalu)
                 statuses.append(ProviderStatus(
                     slug="magalu", name="Magazine Luiza", configured=True, ok=True,
-                    message=f"{len(rows)} ofertas retornadas.",
+                    message=f"{len(rows)} produtos retornados.",
                 ))
             elif error == "timeout":
                 statuses.append(ProviderStatus(
                     slug="magalu", name="Magazine Luiza", configured=True, ok=False,
-                    message="A vitrine demorou mais de 8 segundos; a busca continuou sem bloquear o PriceRadar.",
+                    message="A vitrine não respondeu dentro de 9 segundos.",
                 ))
             else:
-                message = str(error) if isinstance(error, MagaluError) else "Vitrine indisponível no momento."
+                message = str(error) if isinstance(error, MagaluError) else f"Vitrine indisponível: {type(error).__name__}."
                 statuses.append(ProviderStatus(
                     slug="magalu", name="Magazine Luiza", configured=True, ok=False, message=message
                 ))
@@ -159,3 +161,46 @@ async def v212_search(
         reverse=True,
     )
     return SearchResponse(query=query, results=results[: max(limit, 12)], providers=statuses)
+
+
+@app.get("/api/provider-diagnostics")
+async def provider_diagnostics(q: str = Query("rtx 5070", min_length=2, max_length=120)):
+    """Non-secret health probe for debugging outbound retailer connectivity."""
+    query = " ".join(q.strip().split())
+    output: dict[str, Any] = {"query": query, "version": "2.14", "providers": {}}
+
+    ml = MercadoLivreProvider()
+    ml.timeout = 7.5
+    start = time.perf_counter()
+    try:
+        rows, error = await _bounded(lambda: ml.search(query, limit=2), 9.5)
+        output["providers"]["mercadolivre"] = {
+            "configured": ml.configured(),
+            "ok": rows is not None,
+            "count": len(rows or []),
+            "seconds": round(time.perf_counter() - start, 2),
+            "error": None if rows is not None else ("timeout" if error == "timeout" else str(error)),
+        }
+    except Exception as exc:
+        output["providers"]["mercadolivre"] = {
+            "configured": ml.configured(), "ok": False, "count": 0,
+            "seconds": round(time.perf_counter() - start, 2), "error": f"{type(exc).__name__}: {exc}",
+        }
+
+    magalu = MagaluProvider()
+    magalu.timeout = 8.0
+    start = time.perf_counter()
+    try:
+        rows, error = await _bounded(lambda: magalu.search(query, limit=2), 9.5)
+        output["providers"]["magalu"] = {
+            "ok": rows is not None,
+            "count": len(rows or []),
+            "seconds": round(time.perf_counter() - start, 2),
+            "error": None if rows is not None else ("timeout" if error == "timeout" else str(error)),
+        }
+    except Exception as exc:
+        output["providers"]["magalu"] = {
+            "ok": False, "count": 0,
+            "seconds": round(time.perf_counter() - start, 2), "error": f"{type(exc).__name__}: {exc}",
+        }
+    return output
