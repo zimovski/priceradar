@@ -167,6 +167,8 @@ def _variant_words(text: str | None) -> set[str]:
         "slim": "slim",
         "digital": "digital",
         "disc": "disc",
+        "ti": "ti",
+        "super": "super",
     }
     found: set[str] = set()
     for phrase, key in phrases.items():
@@ -180,15 +182,13 @@ def _identity_tokens(text: str | None) -> set[str]:
     ignore = {
         "apple", "sony", "samsung", "branco", "preto", "azul", "verde",
         "cinza", "prata", "prateado", "dourado", "lavanda", "salvia",
-        "gb", "tb",
+        "gb", "tb", "nvidia", "geforce", "gddr7", "gddr6", "bits", "bit",
     }
     cleaned: set[str] = set()
     for token in tokens:
         if token in ignore:
             continue
         if token.isdigit() and len(token) >= 2:
-            # Capacity/generation are checked separately, so formatting such as
-            # "512 GB" versus "512GB" cannot cause a false mismatch here.
             continue
         if re.fullmatch(r"\d{2,4}(?:gb|tb)", token):
             continue
@@ -229,6 +229,68 @@ def _strong_variant_match(product: Product, candidate: dict) -> bool:
     return _score(source_name, target_name) >= 18.0
 
 
+def _magalu_search_query(product: Product) -> str:
+    """Build a compact identity query instead of pasting a long catalog title.
+
+    Marketplace search engines often perform worse when a title includes every
+    technical attribute and internal model suffix. The strict matcher below is
+    still responsible for proving that the returned variant is the same item.
+    """
+    source = " ".join(x for x in (product.brand, product.name, product.model) if x)
+    fam = _family(source)
+    parts: list[str] = []
+    if product.brand:
+        parts.append(product.brand)
+
+    generation = _generation(source, fam) if fam else None
+    if fam == "iphone":
+        parts.append("iPhone")
+        if generation is not None:
+            parts.append(str(generation))
+    elif fam == "playstation":
+        parts.append("PlayStation")
+        if generation is not None:
+            parts.append(str(generation))
+    elif fam == "rtx":
+        parts.append("RTX")
+        if generation is not None:
+            parts.append(str(generation))
+    elif fam == "radeon":
+        parts.append("Radeon RX")
+        if generation is not None:
+            parts.append(str(generation))
+    else:
+        parts.extend(_tokens(product.name)[:5])
+
+    variants = _variant_words(source)
+    for variant in ("ti", "super", "pro max", "pro", "plus", "ultra", "slim", "digital"):
+        if variant in variants:
+            parts.append(variant)
+
+    capacity = _capacity(source)
+    if capacity:
+        parts.append(capacity.upper())
+
+    # Keep one distinctive model/SKU token when the catalog gives us one. This
+    # greatly improves GPU and notebook matching without making the query huge.
+    tokens = _tokens(source)
+    modelish = [
+        token for token in tokens
+        if len(token) >= 7 and any(ch.isdigit() for ch in token) and any(ch.isalpha() for ch in token)
+    ]
+    if modelish:
+        parts.append(modelish[-1])
+
+    compact: list[str] = []
+    seen: set[str] = set()
+    for part in parts:
+        key = _norm(part)
+        if key and key not in seen:
+            seen.add(key)
+            compact.append(str(part))
+    return " ".join(compact) or product.name
+
+
 def _ensure_magalu_link(db: Session, product: Product) -> ProductSourceLink | None:
     existing = db.scalar(select(ProductSourceLink).where(
         ProductSourceLink.product_id == product.id,
@@ -238,12 +300,18 @@ def _ensure_magalu_link(db: Session, product: Product) -> ProductSourceLink | No
         return existing
 
     provider = MagaluProvider()
-    candidates = provider.search(product.name, limit=10)
+    query = _magalu_search_query(product)
+    candidates = provider.search(query, limit=10)
     matches = [row for row in candidates if _strong_variant_match(product, row)]
+    if not matches and query != product.name:
+        # A second, narrower attempt is useful for unusual catalog titles.
+        candidates = provider.search(product.name, limit=10)
+        matches = [row for row in candidates if _strong_variant_match(product, row)]
     if not matches:
         return None
 
-    matches.sort(key=lambda row: _score(product.name, row.get("name")), reverse=True)
+    source_name = " ".join(x for x in (product.brand, product.name, product.model) if x)
+    matches.sort(key=lambda row: _score(source_name, row.get("name")), reverse=True)
     best = matches[0]
     url = best.get("url")
     external_id = str(best.get("external_product_id") or best.get("item_id") or "")
