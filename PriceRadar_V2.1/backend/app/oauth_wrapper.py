@@ -19,15 +19,17 @@ from .providers.mercadolivre_search_enhancement import enable_search_enhancement
 from .providers.mercadolivre_verified_fallback import enable_verified_listing_fallback
 from .providers.mercadolivre_fast_search import enable_fast_search
 from .providers.mercadolivre_stable_search import enable_stable_search
+from .providers.mercadolivre_reliable_v215 import enable_reliable_v215
 
 enable_database_credential_store()
 enable_price_enrichment()
 enable_verified_listing_fallback()
 enable_search_enhancement()
 enable_fast_search()
-# Loaded last on purpose: search must not call the expensive tracking/detail
-# enrichment chain for every candidate.
 enable_stable_search()
+# Final provider override: V2.15 keeps search, price and purchase URL tied to
+# the same real Mercado Livre catalog offer and uses the current bulk item API.
+enable_reliable_v215()
 
 from . import v24_features  # noqa: E402,F401
 from . import v28_features  # noqa: E402,F401
