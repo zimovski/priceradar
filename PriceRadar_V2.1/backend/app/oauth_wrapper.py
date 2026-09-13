@@ -20,6 +20,7 @@ from .providers.mercadolivre_verified_fallback import enable_verified_listing_fa
 from .providers.mercadolivre_fast_search import enable_fast_search
 from .providers.mercadolivre_stable_search import enable_stable_search
 from .providers.mercadolivre_reliable_v215 import enable_reliable_v215
+from .providers.mercadolivre_search_v215_light import enable_light_search_v215
 
 enable_database_credential_store()
 enable_price_enrichment()
@@ -27,15 +28,17 @@ enable_verified_listing_fallback()
 enable_search_enhancement()
 enable_fast_search()
 enable_stable_search()
-# Final provider override: V2.15 keeps search, price and purchase URL tied to
-# the same real Mercado Livre catalog offer and uses the current bulk item API.
+# Final provider overrides: V2.15 keeps tracked prices strict, while search uses
+# a bounded catalog/competition path so Render does not time out.
 enable_reliable_v215()
+enable_light_search_v215()
 
 from . import v24_features  # noqa: E402,F401
 from . import v28_features  # noqa: E402,F401
 from . import v210_multistore  # noqa: E402,F401
 from . import v211_features  # noqa: E402,F401
 from . import v212_resilience  # noqa: E402,F401
+from . import v215_ui  # noqa: E402,F401
 
 AUTH_URL = "https://auth.mercadolivre.com.br/authorization"
 OAUTH_STATES: dict[str, tuple[float, str | None]] = {}
