@@ -1,133 +1,196 @@
 from __future__ import annotations
 
-import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any
 
 from .mercadolivre import MercadoLivreError, MercadoLivreProvider
 from .mercadolivre_search_enhancement import (
-    _acceptable,
-    _catalog_search,
-    _domain_for_query,
+    _device_intent,
     _family,
     _generation,
+    _looks_like_accessory,
     _norm,
-    _query_has_generation,
+    _query_wants_accessory,
     _score,
+    _tokens,
 )
 
 _PATCHED = False
-_CACHE: dict[tuple[str, int], tuple[float, list[dict[str, Any]]]] = {}
-CACHE_TTL_SECONDS = 240
+
+
+def _acceptable(query: str, name: str | None) -> bool:
+    if not name:
+        return False
+    q_tokens = _tokens(query)
+    words = set(_norm(name).split())
+    if not q_tokens:
+        return True
+    if not _query_wants_accessory(query) and _device_intent(query) and _looks_like_accessory(name):
+        return False
+    for token in q_tokens:
+        if any(ch.isdigit() for ch in token) and token not in words:
+            return False
+    coverage = sum(1 for token in q_tokens if token in words) / len(q_tokens)
+    return coverage >= (0.67 if _device_intent(query) else 0.5)
+
+
+def _seller_name(row: dict[str, Any]) -> str | None:
+    seller = row.get("seller")
+    if isinstance(seller, dict):
+        nickname = seller.get("nickname")
+        if nickname:
+            return str(nickname)
+        sid = seller.get("id")
+        if sid:
+            return f"Vendedor #{sid}"
+    sid = row.get("seller_id")
+    return f"Vendedor #{sid}" if sid else None
+
+
+def _listing_result(provider: MercadoLivreProvider, row: dict[str, Any]) -> dict[str, Any] | None:
+    item_id = str(row.get("id") or "").strip()
+    title = str(row.get("title") or "").strip()
+    price = row.get("price")
+    permalink = row.get("permalink")
+    if not item_id or not title or price in (None, "") or not permalink:
+        return None
+
+    attrs = row.get("attributes") or []
+    catalog_id = str(row.get("catalog_product_id") or "").strip() or None
+    shipping = row.get("shipping") if isinstance(row.get("shipping"), dict) else {}
+    qty = row.get("available_quantity")
+    status = row.get("status")
+    available = status in (None, "active")
+    try:
+        if qty is not None and int(qty) <= 0:
+            available = False
+    except (TypeError, ValueError):
+        pass
+
+    return {
+        "external_product_id": catalog_id or f"item:{item_id}",
+        "catalog_product_id": catalog_id,
+        "item_id": item_id,
+        "name": title,
+        "brand": provider._attr(attrs, "BRAND"),
+        "model": provider._attr(attrs, "MODEL"),
+        "gtin": provider._attr(attrs, "GTIN", "EAN", "UPC"),
+        "image_url": row.get("thumbnail") or row.get("secure_thumbnail"),
+        "url": permalink,
+        "price": float(price),
+        "original_price": float(row["original_price"]) if row.get("original_price") else None,
+        "currency": row.get("currency_id") or "BRL",
+        "seller_name": _seller_name(row),
+        "shipping_free": shipping.get("free_shipping") if shipping else None,
+        "available": available,
+        "price_source": "search_listing",
+    }
+
+
+def _rank_rows(query: str, rows: list[dict[str, Any]], limit: int) -> list[dict[str, Any]]:
+    fam = _family(query)
+    newest = None
+    if fam and _generation(query, fam) is None:
+        gens = [_generation(r.get("title"), fam) for r in rows]
+        gens = [g for g in gens if g is not None]
+        if gens:
+            newest = max(gens)
+
+    ranked: list[tuple[float, dict[str, Any]]] = []
+    for row in rows:
+        title = row.get("title")
+        if not _acceptable(query, title):
+            continue
+        score = _score(query, title, newest_generation=newest)
+        ranked.append((score, row))
+    ranked.sort(key=lambda x: x[0], reverse=True)
+    return [row for _, row in ranked[: max(limit * 2, limit)]]
+
+
+def _catalog_fallback(provider: MercadoLivreProvider, query: str, limit: int) -> list[dict[str, Any]]:
+    data = provider._request("GET", "/products/search", params={
+        "status": "active", "site_id": "MLB", "q": query, "limit": 20,
+    })
+    raw = data.get("results") or []
+    raw.sort(key=lambda item: _score(
+        query,
+        item.get("name"),
+        brand=provider._attr(item.get("attributes") or [], "BRAND"),
+        model=provider._attr(item.get("attributes") or [], "MODEL"),
+    ), reverse=True)
+    selected = [x for x in raw if _acceptable(query, x.get("name"))][: min(5, limit)]
+    if not selected:
+        return []
+
+    results: list[dict[str, Any]] = []
+    with ThreadPoolExecutor(max_workers=len(selected)) as pool:
+        futures = {
+            pool.submit(provider.product_detail, str(item.get("id"))): item
+            for item in selected if item.get("id")
+        }
+        for future in as_completed(futures):
+            try:
+                detail = future.result()
+            except Exception:
+                continue
+            if detail and _acceptable(query, detail.get("name")):
+                results.append(detail)
+    results.sort(key=lambda x: _score(query, x.get("name")), reverse=True)
+    return results[:limit]
 
 
 def enable_fast_search() -> None:
-    """Keep semantic ranking while capping expensive product-detail lookups.
+    """Search actual Mercado Livre listings first.
 
-    V2.10 ranked up to 100 catalog rows correctly but then opened 30-60
-    detailed product endpoints sequentially. With a second marketplace this
-    could leave the browser apparently stuck. Here we still rank a broad cheap
-    catalog pool, but verify only the strongest handful and stop as soon as we
-    have enough acceptable results.
+    `/sites/MLB/search` already returns the live listing price and permalink, so
+    one API call can produce useful search cards. This avoids opening many
+    catalog products sequentially, which was the main reason V2.12 timed out on
+    Render. If item search is unavailable, fall back to a very small parallel
+    catalog verification pass instead of freezing the whole request.
     """
     global _PATCHED
     if _PATCHED:
         return
     _PATCHED = True
 
+    def listing_detail(self: MercadoLivreProvider, item_id: str) -> dict[str, Any]:
+        raw_id = str(item_id).removeprefix("item:")
+        row = self._request("GET", f"/items/{raw_id}")
+        if not isinstance(row, dict):
+            raise MercadoLivreError("O Mercado Livre não retornou os dados do anúncio.")
+        detail = _listing_result(self, row)
+        if not detail:
+            raise MercadoLivreError("O anúncio não possui preço e link públicos válidos.")
+        return detail
+
     def search_fast(self: MercadoLivreProvider, query: str, limit: int = 8) -> list[dict[str, Any]]:
-        limit = max(1, min(int(limit), 10))
-        key = (_norm(query), limit)
-        cached = _CACHE.get(key)
-        if cached and time.time() - cached[0] < CACHE_TTL_SECONDS:
-            return [dict(x) for x in cached[1]]
+        limit = max(1, min(int(limit), 12))
+        try:
+            data = self._request("GET", "/sites/MLB/search", params={
+                "q": query,
+                "limit": min(50, max(20, limit * 5)),
+            })
+            raw = data.get("results") or []
+            ranked = _rank_rows(query, raw, limit)
+            results: list[dict[str, Any]] = []
+            seen: set[str] = set()
+            for row in ranked:
+                detail = _listing_result(self, row)
+                if not detail or not detail.get("available"):
+                    continue
+                key = str(detail.get("external_product_id") or detail.get("item_id"))
+                if key in seen:
+                    continue
+                seen.add(key)
+                results.append(detail)
+                if len(results) >= limit:
+                    break
+            if results:
+                return results
+        except MercadoLivreError:
+            pass
 
-        expected_domain = _domain_for_query(query)
-        raw = _catalog_search(self, query, expected_domain)
-        fam = _family(query)
-        newest_generation = None
-        if fam and not _query_has_generation(query, fam):
-            generations = [_generation(item.get("name"), fam) for item in raw]
-            generations = [g for g in generations if g is not None]
-            if generations:
-                newest_generation = max(generations)
+        return _catalog_fallback(self, query, limit)
 
-        ranked = sorted(
-            raw[:100],
-            key=lambda item: _score(
-                query,
-                item.get("name"),
-                domain_id=item.get("domain_id"),
-                brand=self._attr(item.get("attributes") or [], "BRAND"),
-                model=self._attr(item.get("attributes") or [], "MODEL"),
-                newest_generation=newest_generation,
-            ),
-            reverse=True,
-        )
-
-        # Usually 8-12 detail calls are enough after the cheap semantic pass.
-        # The old implementation could do 30-60 calls per keystroke/search.
-        candidate_cap = min(len(ranked), max(limit + 4, 10))
-        detailed: list[dict[str, Any]] = []
-        seen: set[str] = set()
-
-        for item in ranked[:candidate_cap]:
-            product_id = item.get("id")
-            if not product_id or str(product_id) in seen:
-                continue
-            seen.add(str(product_id))
-            try:
-                detail = self.product_detail(product_id)
-            except MercadoLivreError:
-                attrs = item.get("attributes") or []
-                detail = {
-                    "external_product_id": product_id,
-                    "name": item.get("name") or product_id,
-                    "brand": self._attr(attrs, "BRAND"),
-                    "model": self._attr(attrs, "MODEL"),
-                    "gtin": self._attr(attrs, "GTIN", "EAN", "UPC"),
-                    "image_url": self._image(item),
-                    "url": item.get("permalink"),
-                    "item_id": None,
-                    "price": None,
-                    "original_price": None,
-                    "currency": "BRL",
-                    "seller_name": None,
-                    "shipping_free": None,
-                    "available": True,
-                    "domain_id": item.get("domain_id"),
-                }
-
-            detail.setdefault("domain_id", item.get("domain_id"))
-            if not _acceptable(query, detail, expected_domain):
-                continue
-
-            detail["_relevance"] = _score(
-                query,
-                detail.get("name"),
-                domain_id=detail.get("domain_id"),
-                brand=detail.get("brand"),
-                model=detail.get("model"),
-                newest_generation=newest_generation,
-            )
-            detail["_generation"] = _generation(detail.get("name"), fam) if fam else None
-            detailed.append(detail)
-            if len(detailed) >= limit:
-                break
-
-        detailed.sort(
-            key=lambda d: (
-                d.get("_relevance", -100),
-                d.get("_generation") or -1,
-                d.get("price") is not None,
-            ),
-            reverse=True,
-        )
-        result = detailed[:limit]
-        for item in result:
-            item.pop("_relevance", None)
-            item.pop("_generation", None)
-
-        _CACHE[key] = (time.time(), [dict(x) for x in result])
-        return result
-
+    MercadoLivreProvider.listing_detail = listing_detail  # type: ignore[attr-defined]
     MercadoLivreProvider.search = search_fast
