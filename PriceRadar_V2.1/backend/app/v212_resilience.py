@@ -33,27 +33,26 @@ _remove_route("/api/search", "GET")
 @app.get("/", include_in_schema=False, response_class=HTMLResponse)
 def v212_web_preview():
     text = _patched_index()
-    text = text.replace("V2.11", "V2.12")
+    text = text.replace("V2.11", "V2.13")
+    text = text.replace("V2.12", "V2.13")
     text = text.replace("Consultando Mercado Livre...", "Consultando lojas...")
     text = text.replace("Consultando Mercado Livre e Magazine Luiza...", "Consultando lojas...")
 
-    # Do not make opening a product wait for every retailer to answer. Render
-    # the persisted price/history immediately and refresh sources in background.
     old_refresh = "try{try{await api(`/api/products/${id}/refresh`,{method:'POST'})}catch{}const [p,i,o,d,h,best]=await Promise.all"
     new_refresh = "try{api(`/api/products/${id}/refresh`,{method:'POST'}).catch(()=>{});const [p,i,o,d,h,best]=await Promise.all"
     text = text.replace(old_refresh, new_refresh)
 
-    # Once OAuth is stored in PostgreSQL the user should not be prompted to
-    # reconnect on every visit. Keep the Connect action only while disconnected.
     old_action = "<a class=\"btn secondary sm\" href=\"/mercadolivre/connect\">${s.mercadolivre_connected?'Conectado automaticamente':'Conectar'}</a>"
     new_action = "${s.mercadolivre_connected?'<span class=\"chip ok\">sessão persistente</span>':'<a class=\"btn secondary sm\" href=\"/mercadolivre/connect\">Conectar</a>'}"
     text = text.replace(old_action, new_action)
 
-    # Surface partial-provider failures instead of leaving the impression that
-    # the whole search froze or silently failed.
     old_count = "document.querySelector('#searchSub').textContent=`${d.results.length} resultados encontrados`;"
     new_count = "const falhas=(d.providers||[]).filter(p=>!p.ok).map(p=>p.name);document.querySelector('#searchSub').textContent=`${d.results.length} resultados encontrados${falhas.length?' • indisponível agora: '+falhas.join(', '):''}`;"
     text = text.replace(old_count, new_count)
+
+    old_empty = "r.innerHTML=d.results.length?d.results.map(result).join(''):'<div class=\"card empty\"><b>Nenhum resultado</b>Tente marca + modelo.</div>'"
+    new_empty = "r.innerHTML=d.results.length?d.results.map(result).join(''):(falhas.length?'<div class=\"card empty\"><b>As lojas não responderam nesta tentativa</b>Tente novamente em alguns segundos. O PriceRadar não inventa preços quando uma fonte falha.</div>':'<div class=\"card empty\"><b>Nenhum resultado</b>Tente marca + modelo.</div>')"
+    text = text.replace(old_empty, new_empty)
     return HTMLResponse(text)
 
 
@@ -63,7 +62,7 @@ async def _bounded(call: Callable[[], list[dict[str, Any]]], seconds: float):
         return rows, None
     except asyncio.TimeoutError:
         return None, "timeout"
-    except Exception as exc:  # provider-specific message is handled by caller
+    except Exception as exc:
         return None, exc
 
 
@@ -90,16 +89,19 @@ async def v212_search(
         ).all()
     }
 
+    # Mercado Livre V2.13 uses /sites/MLB/search first, which already returns
+    # listing price + permalink in one request. It should therefore be much
+    # faster than the previous catalog-detail fan-out.
     ml = MercadoLivreProvider()
-    ml.timeout = min(float(getattr(ml, "timeout", 18.0)), 6.0)
+    ml.timeout = min(float(getattr(ml, "timeout", 18.0)), 5.0)
     magalu = MagaluProvider()
-    magalu.timeout = 4.5
+    magalu.timeout = 7.0
 
     tasks: list[tuple[str, asyncio.Task]] = []
     if ml.configured():
         tasks.append((
             "mercadolivre",
-            asyncio.create_task(_bounded(lambda: ml.search(query, limit=min(limit, 8)), 8.0)),
+            asyncio.create_task(_bounded(lambda: ml.search(query, limit=min(limit, 8)), 7.0)),
         ))
     else:
         statuses.append(ProviderStatus(
@@ -112,7 +114,7 @@ async def v212_search(
 
     tasks.append((
         "magalu",
-        asyncio.create_task(_bounded(lambda: magalu.search(query, limit=min(limit, 8)), 5.5)),
+        asyncio.create_task(_bounded(lambda: magalu.search(query, limit=min(limit, 8)), 8.5)),
     ))
 
     for slug, task in tasks:
@@ -121,12 +123,13 @@ async def v212_search(
             if rows is not None:
                 _append_external(results, "mercadolivre", "Mercado Livre", rows, known_ml)
                 statuses.append(ProviderStatus(
-                    slug="mercadolivre", name="Mercado Livre", configured=True, ok=True
+                    slug="mercadolivre", name="Mercado Livre", configured=True, ok=True,
+                    message=f"{len(rows)} ofertas retornadas.",
                 ))
             elif error == "timeout":
                 statuses.append(ProviderStatus(
                     slug="mercadolivre", name="Mercado Livre", configured=True, ok=False,
-                    message="A consulta passou de 8 segundos; os demais resultados foram liberados sem esperar.",
+                    message="A consulta passou de 7 segundos.",
                 ))
             else:
                 message = str(error) if isinstance(error, MercadoLivreError) else "Mercado Livre indisponível nesta busca."
@@ -137,12 +140,13 @@ async def v212_search(
             if rows is not None:
                 _append_external(results, "magalu", "Magazine Luiza", rows, known_magalu)
                 statuses.append(ProviderStatus(
-                    slug="magalu", name="Magazine Luiza", configured=True, ok=True
+                    slug="magalu", name="Magazine Luiza", configured=True, ok=True,
+                    message=f"{len(rows)} ofertas retornadas.",
                 ))
             elif error == "timeout":
                 statuses.append(ProviderStatus(
                     slug="magalu", name="Magazine Luiza", configured=True, ok=False,
-                    message="A vitrine demorou mais de 5 segundos; a busca continuou sem bloquear o PriceRadar.",
+                    message="A vitrine demorou mais de 8 segundos; a busca continuou sem bloquear o PriceRadar.",
                 ))
             else:
                 message = str(error) if isinstance(error, MagaluError) else "Vitrine indisponível no momento."
@@ -150,7 +154,6 @@ async def v212_search(
                     slug="magalu", name="Magazine Luiza", configured=True, ok=False, message=message
                 ))
 
-    # External priced results first, then tracked/local history entries.
     results.sort(
         key=lambda r: (r.price is not None, r.source != "local"),
         reverse=True,
