@@ -16,15 +16,20 @@ from .providers.mercadolivre import MercadoLivreProvider, MercadoLivreError
 from .providers.mercadolivre_db_store import enable_database_credential_store
 from .providers.mercadolivre_price_enrichment import enable_price_enrichment
 from .providers.mercadolivre_search_enhancement import enable_search_enhancement
+from .providers.mercadolivre_verified_fallback import enable_verified_listing_fallback
+from .providers.mercadolivre_fast_search import enable_fast_search
 
 enable_database_credential_store()
 enable_price_enrichment()
+enable_verified_listing_fallback()
 enable_search_enhancement()
+enable_fast_search()
 
 from . import v24_features  # noqa: E402,F401
 from . import v28_features  # noqa: E402,F401
 from . import v210_multistore  # noqa: E402,F401
 from . import v211_features  # noqa: E402,F401
+from . import v212_resilience  # noqa: E402,F401
 
 AUTH_URL = "https://auth.mercadolivre.com.br/authorization"
 OAUTH_STATES: dict[str, tuple[float, str | None]] = {}
