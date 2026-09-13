@@ -16,19 +16,10 @@ class MagaluError(RuntimeError):
 
 
 class MagaluProvider:
-    """Read-only connector for Magalu's public storefront.
-
-    The official Magalu Open API is aimed at sellers/integrators. PriceRadar is
-    a consumer price comparator, so this connector reads only public storefront
-    pages that a normal shopper can open. No login, cart or account action is
-    performed. If Magalu changes its markup or blocks the request, we fail
-    closed and return no invented price.
-    """
-
     slug = "magalu"
     name = "Magazine Luiza"
     base_url = "https://www.magazineluiza.com.br"
-    timeout = 7.0
+    timeout = 8.0
     cache_ttl = 300
     _cache: dict[tuple[str, int], tuple[float, list[dict[str, Any]]]] = {}
 
@@ -65,11 +56,9 @@ class MagaluProvider:
 
     @staticmethod
     def _request_headers() -> dict[str, str]:
-        # A browser-like request is important here: Magalu's edge sometimes
-        # delays or rejects obviously synthetic user agents even for public pages.
         return {
             "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
-            "Accept-Language": "pt-BR,pt;q=0.9,en-US;q=0.6,en;q=0.5",
+            "Accept-Language": "pt-BR,pt;q=0.9,en-US;q=0.7,en;q=0.6",
             "Cache-Control": "no-cache",
             "Pragma": "no-cache",
             "Upgrade-Insecure-Requests": "1",
@@ -77,24 +66,27 @@ class MagaluProvider:
         }
 
     def _get_html(self, url: str) -> str:
+        timeout = httpx.Timeout(self.timeout, connect=min(4.0, self.timeout))
         try:
-            timeout = httpx.Timeout(self.timeout, connect=min(3.5, self.timeout))
             with httpx.Client(timeout=timeout, follow_redirects=True, headers=self._request_headers(), http2=False) as client:
                 response = client.get(url)
         except httpx.RequestError as exc:
-            raise MagaluError("Não consegui consultar o Magazine Luiza agora.") from exc
+            raise MagaluError("Não consegui alcançar a vitrine do Magazine Luiza agora.") from exc
         if response.status_code >= 400:
             raise MagaluError(f"Magazine Luiza respondeu {response.status_code}.")
-        return response.text
+        text = response.text or ""
+        if len(text) < 500:
+            raise MagaluError("A vitrine do Magalu respondeu sem conteúdo utilizável.")
+        return text
 
     def _search_urls(self, query: str) -> list[str]:
         normalized = " ".join(query.strip().split())
         encoded_plus = quote(normalized.replace(" ", "+"), safe="")
         encoded_space = quote(normalized, safe="")
         return [
+            f"{self.base_url}/busca/{encoded_plus}/?bypass=true",
+            f"{self.base_url}/busca/{encoded_space}/?bypass=true",
             f"{self.base_url}/busca/{encoded_plus}/",
-            f"{self.base_url}/busca/{encoded_space}/",
-            f"https://m.magazineluiza.com.br/busca/{encoded_plus}/",
         ]
 
     def _candidate_title(self, anchor) -> str:
@@ -115,8 +107,21 @@ class MagaluProvider:
                     return value
         return self._clean_title(anchor.get_text(" ", strip=True))
 
-    def _candidate_image(self, anchor) -> str | None:
-        img = anchor.find("img")
+    @staticmethod
+    def _find_price_container(anchor):
+        node = anchor
+        for _ in range(5):
+            text = " ".join(node.stripped_strings)
+            if "R$" in text and len(text) <= 3500:
+                return node
+            if not getattr(node, "parent", None):
+                break
+            node = node.parent
+        return anchor
+
+    @staticmethod
+    def _candidate_image(node) -> str | None:
+        img = node.find("img")
         if not img:
             return None
         for attr in ("src", "data-src", "data-original"):
@@ -142,21 +147,32 @@ class MagaluProvider:
             product_id = self._product_id(href)
             if not product_id or product_id in seen:
                 continue
-            text = " ".join(anchor.stripped_strings)
+
+            container = self._find_price_container(anchor)
+            text = " ".join(container.stripped_strings)
             if "R$" not in text:
                 continue
             title = self._candidate_title(anchor)
             if len(title) < 4:
+                for selector in ("h2", "h3", "h4"):
+                    node = container.select_one(selector)
+                    if node:
+                        title = self._clean_title(node.get_text(" ", strip=True))
+                        break
+            if len(title) < 4:
                 continue
+
             values = self._money_values(text)
             if not values:
                 continue
-
-            pix_price = values[0]
+            pix_match = re.search(r"R\$\s*([0-9][0-9\.]*,[0-9]{2})\s+no\s+Pix", text, flags=re.I)
+            pix_price = self._money(pix_match.group(1)) if pix_match else values[0]
             regular_match = re.search(r"\bOu\s+R\$\s*([0-9][0-9\.]*,[0-9]{2})", text, flags=re.I)
-            regular_price = self._money(regular_match.group(1)) if regular_match else pix_price
+            regular_price = self._money(regular_match.group(1)) if regular_match else values[0]
             if regular_price is None or regular_price <= 0:
                 regular_price = pix_price
+            if pix_price is None or pix_price <= 0:
+                pix_price = regular_price
 
             seen.add(product_id)
             rows.append({
@@ -165,12 +181,12 @@ class MagaluProvider:
                 "brand": None,
                 "model": None,
                 "gtin": None,
-                "image_url": self._candidate_image(anchor),
+                "image_url": self._candidate_image(container),
                 "url": href,
                 "item_id": product_id,
                 "price": regular_price,
                 "pix_price": pix_price,
-                "original_price": regular_price if regular_price > pix_price else None,
+                "original_price": regular_price if regular_price and pix_price and regular_price > pix_price else None,
                 "currency": "BRL",
                 "seller_name": None,
                 "shipping_free": None,
@@ -209,7 +225,6 @@ class MagaluProvider:
                     break
             except MagaluError as exc:
                 last_error = exc
-                continue
         if not rows and last_error:
             raise MagaluError(str(last_error))
 
@@ -250,7 +265,9 @@ class MagaluProvider:
             title = external_product_id or "Produto Magalu"
 
         page_text = " ".join(soup.stripped_strings)
-        pix_match = re.search(r"Preço\s+R\$\s*([0-9][0-9\.]*,[0-9]{2}).{0,100}?no\s+Pix", page_text, flags=re.I)
+        pix_match = re.search(r"Preço\s+R\$\s*([0-9][0-9\.]*,[0-9]{2}).{0,120}?no\s+Pix", page_text, flags=re.I)
+        if not pix_match:
+            pix_match = re.search(r"R\$\s*([0-9][0-9\.]*,[0-9]{2})\s+no\s+Pix", page_text, flags=re.I)
         if not pix_match:
             pix_match = re.search(r"Preço\s+R\$\s*([0-9][0-9\.]*,[0-9]{2})", page_text, flags=re.I)
         pix_price = self._money(pix_match.group(1)) if pix_match else None
