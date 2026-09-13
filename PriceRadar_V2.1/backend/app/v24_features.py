@@ -15,7 +15,7 @@ from .database import get_db
 from .main import app
 from .models import Offer, PriceObservation, Product, Retailer
 
-VERSION = "0.2.7"
+VERSION = "0.2.10"
 app.version = VERSION
 _RATE_BUCKETS: dict[str, deque[float]] = defaultdict(deque)
 
@@ -239,6 +239,7 @@ def system_status():
         "version": VERSION,
         "database": "postgresql" if db_url.startswith("postgres") else "sqlite",
         "mercadolivre_connected": ml.configured(),
+        "magalu_search_enabled": True,
         "collector_configured": bool(os.getenv("COLLECTOR_SECRET")),
         "server_time": datetime.now(timezone.utc),
     }
