@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import re
 import time
 from urllib.parse import quote, urljoin, urlparse
@@ -8,7 +9,10 @@ from typing import Any
 import httpx
 from bs4 import BeautifulSoup
 
-from .mercadolivre_search_enhancement import _family, _generation, _norm, _score, _tokens, _looks_like_accessory, _query_wants_accessory, _device_intent
+from .mercadolivre_search_enhancement import (
+    _family, _generation, _norm, _score, _tokens, _looks_like_accessory,
+    _query_wants_accessory, _device_intent,
+)
 
 
 class MagaluError(RuntimeError):
@@ -24,9 +28,13 @@ class MagaluProvider:
     _cache: dict[tuple[str, int], tuple[float, list[dict[str, Any]]]] = {}
 
     @staticmethod
-    def _money(value: str) -> float | None:
+    def _money(value: str | float | int | None) -> float | None:
+        if value is None:
+            return None
+        if isinstance(value, (int, float)):
+            return float(value) if float(value) > 0 else None
         try:
-            return float(value.replace(".", "").replace(",", "."))
+            return float(str(value).replace(".", "").replace(",", "."))
         except Exception:
             return None
 
@@ -83,10 +91,14 @@ class MagaluProvider:
         normalized = " ".join(query.strip().split())
         encoded_plus = quote(normalized.replace(" ", "+"), safe="")
         encoded_space = quote(normalized, safe="")
+        # The normal SSR URL is first because it currently exposes full product
+        # cards (title + price + /p/{id}/ link) to ordinary browsers. bypass is
+        # kept only as a fallback because its markup is not always identical.
         return [
-            f"{self.base_url}/busca/{encoded_plus}/?bypass=true",
-            f"{self.base_url}/busca/{encoded_space}/?bypass=true",
             f"{self.base_url}/busca/{encoded_plus}/",
+            f"{self.base_url}/busca/{encoded_space}/",
+            f"{self.base_url}/busca/{encoded_plus}/?bypass=true",
+            f"https://m.magazineluiza.com.br/busca/{encoded_plus}/",
         ]
 
     def _candidate_title(self, anchor) -> str:
@@ -110,9 +122,9 @@ class MagaluProvider:
     @staticmethod
     def _find_price_container(anchor):
         node = anchor
-        for _ in range(5):
+        for _ in range(6):
             text = " ".join(node.stripped_strings)
-            if "R$" in text and len(text) <= 3500:
+            if "R$" in text and len(text) <= 5000:
                 return node
             if not getattr(node, "parent", None):
                 break
@@ -135,10 +147,84 @@ class MagaluProvider:
                 return first
         return None
 
+    def _parse_json_ld(self, soup: BeautifulSoup) -> list[dict[str, Any]]:
+        rows: list[dict[str, Any]] = []
+
+        def walk(value: Any):
+            if isinstance(value, list):
+                for item in value:
+                    walk(item)
+                return
+            if not isinstance(value, dict):
+                return
+            graph = value.get("@graph")
+            if graph:
+                walk(graph)
+            items = value.get("itemListElement")
+            if items:
+                walk(items)
+            item = value.get("item")
+            if isinstance(item, dict):
+                walk(item)
+
+            kind = value.get("@type")
+            kinds = set(kind if isinstance(kind, list) else [kind])
+            if "Product" not in kinds:
+                return
+            name = self._clean_title(str(value.get("name") or ""))
+            url = str(value.get("url") or "")
+            product_id = self._product_id(url)
+            offers = value.get("offers")
+            if isinstance(offers, list):
+                offers = offers[0] if offers else {}
+            if not isinstance(offers, dict):
+                offers = {}
+            price = self._money(offers.get("price") or offers.get("lowPrice"))
+            if not (name and product_id and price):
+                return
+            image = value.get("image")
+            if isinstance(image, list):
+                image = image[0] if image else None
+            rows.append({
+                "external_product_id": product_id,
+                "name": name,
+                "brand": (value.get("brand") or {}).get("name") if isinstance(value.get("brand"), dict) else None,
+                "model": value.get("model"),
+                "gtin": value.get("gtin13") or value.get("gtin14") or value.get("sku"),
+                "image_url": str(image) if image else None,
+                "url": urljoin(self.base_url, url),
+                "item_id": product_id,
+                "price": price,
+                "pix_price": price,
+                "original_price": None,
+                "currency": offers.get("priceCurrency") or "BRL",
+                "seller_name": None,
+                "shipping_free": None,
+                "available": True,
+            })
+
+        for script in soup.find_all("script", attrs={"type": "application/ld+json"}):
+            raw = script.string or script.get_text("", strip=True)
+            if not raw:
+                continue
+            try:
+                walk(json.loads(raw))
+            except Exception:
+                continue
+        return rows
+
     def _parse_search_cards(self, html: str, query: str) -> list[dict[str, Any]]:
         soup = BeautifulSoup(html, "html.parser")
         seen: set[str] = set()
         rows: list[dict[str, Any]] = []
+
+        # Prefer explicit structured data when present.
+        for row in self._parse_json_ld(soup):
+            pid = str(row.get("external_product_id") or "")
+            if pid and pid not in seen:
+                seen.add(pid)
+                rows.append(row)
+
         for anchor in soup.find_all("a", href=True):
             href = urljoin(self.base_url, anchor.get("href"))
             parsed = urlparse(href)
@@ -192,6 +278,45 @@ class MagaluProvider:
                 "shipping_free": None,
                 "available": True,
             })
+
+        # Markup changes sometimes move all textual card content outside the
+        # anchor. As a final parser fallback, inspect a bounded chunk after every
+        # /p/{id}/ URL and recover a nearby R$ amount + human-readable title.
+        if not rows:
+            for match in re.finditer(r'href=["\']([^"\']+/p/([^/?#"\']+)/[^"\']*)["\']', html, flags=re.I):
+                href = urljoin(self.base_url, match.group(1))
+                product_id = match.group(2)
+                if product_id in seen:
+                    continue
+                chunk = re.sub(r"<[^>]+>", " ", html[match.start(): match.start() + 6000])
+                chunk = " ".join(chunk.split())
+                values = self._money_values(chunk)
+                if not values:
+                    continue
+                before_price = re.split(r"\b(?:Preço|R\$)\b", chunk, maxsplit=1, flags=re.I)[0]
+                title = self._clean_title(before_price[-500:])
+                if len(title) < 8:
+                    continue
+                seen.add(product_id)
+                rows.append({
+                    "external_product_id": product_id,
+                    "name": title,
+                    "brand": None,
+                    "model": None,
+                    "gtin": None,
+                    "image_url": None,
+                    "url": href,
+                    "item_id": product_id,
+                    "price": values[0],
+                    "pix_price": values[0],
+                    "original_price": None,
+                    "currency": "BRL",
+                    "seller_name": None,
+                    "shipping_free": None,
+                    "available": True,
+                })
+                if len(rows) >= 30:
+                    break
         return rows
 
     @staticmethod
@@ -205,6 +330,10 @@ class MagaluProvider:
         for token in q_tokens:
             if any(ch.isdigit() for ch in token) and token not in words:
                 return False
+        q = _norm(query)
+        n = _norm(name)
+        if ("rtx" in q or "geforce" in q) and ("ti" in q) != (re.search(r"\bti\b", n) is not None):
+            return False
         coverage = sum(1 for token in q_tokens if token in words) / len(q_tokens)
         return coverage >= (0.67 if _device_intent(query) else 0.5)
 
@@ -216,17 +345,18 @@ class MagaluProvider:
             return [dict(x) for x in cached[1]]
 
         rows: list[dict[str, Any]] = []
-        last_error: Exception | None = None
+        errors: list[str] = []
         for url in self._search_urls(query):
             try:
                 html = self._get_html(url)
                 rows = self._parse_search_cards(html, query)
                 if rows:
                     break
+                errors.append("página respondeu, mas nenhum card de produto foi reconhecido")
             except MagaluError as exc:
-                last_error = exc
-        if not rows and last_error:
-            raise MagaluError(str(last_error))
+                errors.append(str(exc))
+        if not rows and errors:
+            raise MagaluError(errors[-1])
 
         fam = _family(query)
         newest = None
