@@ -23,6 +23,7 @@ enable_search_enhancement()
 
 from . import v24_features  # noqa: E402,F401
 from . import v28_features  # noqa: E402,F401
+from . import v210_multistore  # noqa: E402,F401
 
 AUTH_URL = "https://auth.mercadolivre.com.br/authorization"
 OAUTH_STATES: dict[str, tuple[float, str | None]] = {}
