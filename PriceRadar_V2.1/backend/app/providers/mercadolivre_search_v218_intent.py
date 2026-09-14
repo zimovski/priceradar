@@ -4,7 +4,6 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any
 
 from .mercadolivre import MercadoLivreError, MercadoLivreProvider
-from .mercadolivre_search_enhancement import _attr if False else None
 from .mercadolivre_search_enhancement import _domain_for_query, _family, _generation, _query_has_generation
 from .mercadolivre_search_v215_light import _search_detail
 from .search_intent_v218 import acceptable, query_variants, relevance_score
@@ -54,7 +53,6 @@ def enable_intent_search_v218() -> None:
                 item["_intent_score"] = score
                 if not current or score > float(current.get("_intent_score") or -999):
                     merged[pid] = item
-            # Do not make extra catalog calls once we already have a healthy pool.
             if len(merged) >= 25:
                 break
 
