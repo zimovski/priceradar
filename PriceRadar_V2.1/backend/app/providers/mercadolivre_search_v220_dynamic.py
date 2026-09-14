@@ -9,10 +9,25 @@ from .search_intent_v218 import acceptable, query_variants, relevance_score
 
 _PATCHED = False
 
+# Keep attributes that describe the product the shopper is buying. Generic
+# WEIGHT/HEIGHT/PACKAGE fields are intentionally excluded: a washing machine can
+# weigh 42 kg while its washing capacity is 17 kg, and mixing those values would
+# make a natural query such as "máquina de lavar 17kg" fail incorrectly.
+_IDENTITY_ATTRS = {
+    "BRAND", "MODEL", "LINE", "MPN", "GTIN", "EAN", "UPC",
+    "WASHING_MACHINE_CAPACITY", "CAPACITY", "NET_CAPACITY",
+    "INTERNAL_MEMORY", "RAM", "STORAGE_CAPACITY", "SSD_CAPACITY",
+    "REFRESH_RATE", "SCREEN_SIZE", "DISPLAY_SIZE",
+    "AIR_CONDITIONING_CAPACITY", "COOLING_CAPACITY", "BTU_PER_HOUR",
+    "VOLTAGE", "POWER", "COLOR", "MAIN_COLOR",
+}
+
 
 def _attribute_text(row: dict[str, Any]) -> str:
     parts: list[str] = [str(row.get("name") or row.get("title") or "")]
     for attr in row.get("attributes") or []:
+        if str(attr.get("id") or "") not in _IDENTITY_ATTRS:
+            continue
         value = attr.get("value_name")
         if value not in (None, ""):
             parts.append(str(value))
@@ -49,9 +64,9 @@ def enable_dynamic_domain_search_v220() -> None:
     Static domain rules work for iPhone/RTX but fail on long-tail categories such
     as washing machines. The official domain_discovery endpoint lets Mercado
     Livre decide the product family, then /products/search finds catalog products
-    inside that family. Candidate attributes are included in matching so a query
-    such as "máquina de lavar 17kg" can match even when the visible title formats
-    capacity differently or only exposes it as an attribute.
+    inside that family. Candidate identity attributes are included in matching so
+    a query such as "máquina de lavar 17kg" can match even when capacity is only
+    exposed as WASHING_MACHINE_CAPACITY.
     """
     global _PATCHED
     if _PATCHED:
@@ -129,7 +144,6 @@ def enable_dynamic_domain_search_v220() -> None:
                 detail = details.get(pid)
                 if not detail:
                     continue
-                # Validate against catalog identity + attributes, not title only.
                 identity = _attribute_text(row)
                 if not acceptable(query, identity):
                     continue
@@ -148,7 +162,6 @@ def enable_dynamic_domain_search_v220() -> None:
             if results:
                 return results[:limit]
 
-        # Keep V2.19's real-listing search as a secondary path.
         return previous_search(self, query, limit=limit)
 
     MercadoLivreProvider.search = search
