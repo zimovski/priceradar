@@ -53,6 +53,7 @@ from . import v217_similarity  # noqa: E402,F401
 from . import v218_intent  # noqa: E402,F401
 from . import v219_accuracy  # noqa: E402,F401
 from . import v220_reliability  # noqa: E402,F401
+from . import v220_ui_truth  # noqa: E402,F401
 
 AUTH_URL = "https://auth.mercadolivre.com.br/authorization"
 OAUTH_STATES: dict[str, tuple[float, str | None]] = {}
