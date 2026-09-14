@@ -23,6 +23,7 @@ from .providers.mercadolivre_reliable_v215 import enable_reliable_v215
 from .providers.mercadolivre_search_v215_light import enable_light_search_v215
 from .providers.mercadolivre_search_v218_intent import enable_intent_search_v218
 from .providers.mercadolivre_search_v219_listings import enable_listing_search_v219
+from .providers.mercadolivre_search_v220_dynamic import enable_dynamic_domain_search_v220
 from .providers.magalu_browser_v219 import enable_magalu_browser_v219
 
 enable_database_credential_store()
@@ -34,9 +35,11 @@ enable_stable_search()
 enable_reliable_v215()
 enable_light_search_v215()
 enable_intent_search_v218()
-# V2.19 is loaded last: real marketplace listings make broad consumer searches
-# much more useful, while Magalu uses a browser-grade TLS fingerprint on Render.
 enable_listing_search_v219()
+# V2.20 uses Mercado Livre's own domain predictor for natural shopper searches.
+# It is loaded after the listing search so the latter remains the fallback.
+enable_dynamic_domain_search_v220()
+# Keep direct browser-grade Magalu fetching; V2.20 also adds a rendered fallback.
 enable_magalu_browser_v219()
 
 from . import v24_features  # noqa: E402,F401
@@ -49,6 +52,7 @@ from . import v216_magalu  # noqa: E402,F401
 from . import v217_similarity  # noqa: E402,F401
 from . import v218_intent  # noqa: E402,F401
 from . import v219_accuracy  # noqa: E402,F401
+from . import v220_reliability  # noqa: E402,F401
 
 AUTH_URL = "https://auth.mercadolivre.com.br/authorization"
 OAUTH_STATES: dict[str, tuple[float, str | None]] = {}
