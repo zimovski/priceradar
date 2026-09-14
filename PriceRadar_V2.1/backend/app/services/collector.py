@@ -139,14 +139,27 @@ def record_ml_detail(db: Session, product: Product, detail: dict, *, source_name
     )
 
 
-def record_magalu_detail(db: Session, product: Product, detail: dict) -> int | None:
+def record_magalu_detail(
+    db: Session,
+    product: Product,
+    detail: dict,
+    *,
+    source_name: str = "magalu_public_storefront",
+) -> int | None:
+    """Record a Magalu offer.
+
+    source_name may carry the cross-store match quality, e.g.
+    ``magalu_equivalent_82``. Keeping this in the observation lets the UI explain
+    when a comparison is exact-ish versus merely a close alternative without a
+    database migration.
+    """
     return _record_detail(
         db,
         product,
         detail,
         retailer_slug="magalu",
         retailer_name="Magazine Luiza",
-        source_name="magalu_public_storefront",
+        source_name=source_name,
     )
 
 
@@ -230,12 +243,6 @@ def _strong_variant_match(product: Product, candidate: dict) -> bool:
 
 
 def _magalu_search_query(product: Product) -> str:
-    """Build a compact identity query instead of pasting a long catalog title.
-
-    Marketplace search engines often perform worse when a title includes every
-    technical attribute and internal model suffix. The strict matcher below is
-    still responsible for proving that the returned variant is the same item.
-    """
     source = " ".join(x for x in (product.brand, product.name, product.model) if x)
     fam = _family(source)
     parts: list[str] = []
@@ -271,8 +278,6 @@ def _magalu_search_query(product: Product) -> str:
     if capacity:
         parts.append(capacity.upper())
 
-    # Keep one distinctive model/SKU token when the catalog gives us one. This
-    # greatly improves GPU and notebook matching without making the query huge.
     tokens = _tokens(source)
     modelish = [
         token for token in tokens
@@ -304,7 +309,6 @@ def _ensure_magalu_link(db: Session, product: Product) -> ProductSourceLink | No
     candidates = provider.search(query, limit=10)
     matches = [row for row in candidates if _strong_variant_match(product, row)]
     if not matches and query != product.name:
-        # A second, narrower attempt is useful for unusual catalog titles.
         candidates = provider.search(product.name, limit=10)
         matches = [row for row in candidates if _strong_variant_match(product, row)]
     if not matches:
