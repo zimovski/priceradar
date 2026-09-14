@@ -53,7 +53,9 @@ def enable_intent_search_v218() -> None:
                 item["_intent_score"] = score
                 if not current or score > float(current.get("_intent_score") or -999):
                     merged[pid] = item
-            if len(merged) >= 25:
+
+            relevant_count = sum(1 for item in merged.values() if acceptable(query, item.get("name")))
+            if relevant_count >= max(6, limit):
                 break
 
         if not merged:
