@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from urllib.parse import quote
 
+import httpx
+
 from .magalu_reader_v220 import _parse_reader_markdown, _reader_get
 from .magalu_web import MagaluError, MagaluProvider
 from .search_intent_v218 import acceptable, query_variants, relevance_score
@@ -31,29 +33,51 @@ def _rank(query: str, rows: list[dict], limit: int) -> list[dict]:
     return rows2[:limit]
 
 
-def magalu_search_fast_v221(query: str, limit: int = 8) -> list[dict]:
-    """Bounded Magalu public-store search.
+def _direct_mobile(provider: MagaluProvider, url: str) -> str:
+    """One bounded network attempt; do not chain two 5s clients before fallback."""
+    headers = provider._request_headers()
+    try:
+        from curl_cffi import requests as curl_requests
+        response = curl_requests.get(
+            url,
+            headers=headers,
+            timeout=4.2,
+            impersonate="chrome",
+            allow_redirects=True,
+        )
+        text = response.text or ""
+        if response.status_code < 400 and len(text) >= 500:
+            return text
+        raise MagaluError(f"Magalu mobile respondeu {response.status_code}.")
+    except ImportError:
+        pass
+    except Exception as exc:
+        raise MagaluError(f"Magalu mobile direto falhou: {type(exc).__name__}: {exc}") from exc
 
-    The old connector could try many URLs and then wait for all threads, causing
-    18-second timeouts. This version tries at most two retailer-friendly query
-    variants and, per variant, only one mobile storefront request plus one
-    browser-rendered Reader fallback. It never uses Jina Search, whose anonymous
-    endpoint is blocked without an API key.
-    """
+    try:
+        with httpx.Client(timeout=httpx.Timeout(4.2, connect=2.5), follow_redirects=True, headers=headers) as client:
+            response = client.get(url)
+    except httpx.RequestError as exc:
+        raise MagaluError("Magalu mobile direto não respondeu.") from exc
+    text = response.text or ""
+    if response.status_code >= 400 or len(text) < 500:
+        raise MagaluError(f"Magalu mobile respondeu {response.status_code} sem conteúdo útil.")
+    return text
+
+
+def magalu_search_fast_v221(query: str, limit: int = 8) -> list[dict]:
+    """Fast public Magalu search with one direct attempt and one Reader fallback."""
     limit = max(1, min(int(limit), 12))
     provider = MagaluProvider()
-    provider.timeout = 5.5
     variants = query_variants(query)[:2] or [query]
     errors: list[str] = []
 
     for variant in variants:
-        encoded = quote(" ".join(variant.split()).replace(" ", "+"), safe="+")
+        encoded = quote(" ".join(variant.split()).replace(" ", "+"), safe="")
         mobile_url = f"https://m.magazineluiza.com.br/busca/{encoded}/"
 
-        # 1) Real mobile storefront. The existing provider is patched with a
-        # browser-like TLS fingerprint and falls back to ordinary HTTP.
         try:
-            html = provider._get_html(mobile_url)
+            html = _direct_mobile(provider, mobile_url)
             rows = _rank(query, provider._parse_search_cards(html, variant), limit)
             if rows:
                 for row in rows:
@@ -62,10 +86,10 @@ def magalu_search_fast_v221(query: str, limit: int = 8) -> list[dict]:
         except Exception as exc:
             errors.append(f"mobile: {type(exc).__name__}: {exc}")
 
-        # 2) Browser-rendered public search page. Reader is available without a
-        # key at a small rate limit and avoids the datacenter HTML challenge.
+        # Reader supports anonymous URL reading (small rate limit). We do not use
+        # s.jina.ai search here because anonymous Search is blocked without a key.
         try:
-            markdown = _reader_get(mobile_url, timeout=8.5)
+            markdown = _reader_get(mobile_url, timeout=7.2)
             rows = _rank(query, _parse_reader_markdown(markdown, query, max(limit, 10)), limit)
             if rows:
                 for row in rows:
