@@ -25,6 +25,7 @@ from .providers.mercadolivre_search_v218_intent import enable_intent_search_v218
 from .providers.mercadolivre_search_v219_listings import enable_listing_search_v219
 from .providers.mercadolivre_search_v220_dynamic import enable_dynamic_domain_search_v220
 from .providers.mercadolivre_search_v221_public import enable_public_listing_search_v221
+from .providers.mercadolivre_search_v222_stable import enable_stable_natural_search_v222
 from .providers.magalu_browser_v219 import enable_magalu_browser_v219
 
 enable_database_credential_store()
@@ -38,9 +39,10 @@ enable_light_search_v215()
 enable_intent_search_v218()
 enable_listing_search_v219()
 enable_dynamic_domain_search_v220()
-# V2.21 is deliberately last: normal shopper searches use one fast public
-# Mercado Livre listing request instead of a chain of catalog/domain calls.
 enable_public_listing_search_v221()
+# Final V2.22 override: one predictable authenticated catalog path replaces the
+# accumulated public/catalog fallback chain that regressed search reliability.
+enable_stable_natural_search_v222()
 enable_magalu_browser_v219()
 
 from . import v24_features  # noqa: E402,F401
@@ -57,6 +59,7 @@ from . import v220_reliability  # noqa: E402,F401
 from . import v220_hotfix  # noqa: E402,F401
 from . import v220_ui_truth  # noqa: E402,F401
 from . import v221_fastsearch  # noqa: E402,F401
+from . import v222_stabilize  # noqa: E402,F401
 
 AUTH_URL = "https://auth.mercadolivre.com.br/authorization"
 OAUTH_STATES: dict[str, tuple[float, str | None]] = {}
